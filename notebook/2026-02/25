@@ -1,0 +1,3 @@
+## Update
+
+We completed the first iteration of our PCB design and finalized the project proposal. The initial PCB layout is now drafted with core components placed and routed based on our current system requirements. In parallel, the proposal has been updated to reflect our design goals, architecture decisions, and the implementation plan for the next phase. Next, we will review the schematic and layout for consistency, run basic design rule checks (DRC), and prepare for ordering and bring-up.
