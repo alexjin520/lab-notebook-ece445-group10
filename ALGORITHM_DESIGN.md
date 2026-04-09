@@ -9,13 +9,21 @@ OmniSense-Dual is a wearable obstacle-detection system for visually impaired
 users.  It consists of **two independent modules** worn on the body:
 
 | Module | Placement | Purpose |
-|--------|-----------|---------|
+|--------|-----------|----------|
 | **Head** | Head / helmet | Detects head-height hazards (awnings, signs, doorframes, overhangs) |
 | **Body** | Waist / torso | Detects body-level hazards (furniture, walls, people, vehicles) |
 
 Each module runs its own ESP32-S3 microcontroller and transmits sensor packets
-to this Flask server over Wi-Fi.  The server fuses the sensor data and returns
-a set of 8 haptic motor commands that the ESP32 drives in real-time.
+to this Flask server over Wi-Fi.  The server **fuses data from both modules
+together** into a single combined decision and returns **one set of 8 haptic
+motor commands intended for the head module only** — the head is the sole
+output device because it is always worn and sits at the most exposed position.
+
+> **Why head-only output?**  Both modules see the same physical space from
+> different heights.  Separating the output would require the user to
+> interpret two independent vibration streams simultaneously, which is
+> cognitively overloading.  A single fused stream on the head conveys the
+> worst hazard in any direction regardless of which module detected it.
 
 ---
 
@@ -236,19 +244,66 @@ cause false readings.
 
 ---
 
-## 7. Module Distinction
+## 7. Dual-Module Sensor Fusion
 
-The `module` field in the request payload routes processing to
-module-specific tuning:
+Because both modules observe the same environment from different heights,
+their sensor readings are merged before any motor command is generated.
 
-| Feature                 | `"head"` module      | `"body"` module   |
-|-------------------------|----------------------|-------------------|
-| CRITICAL threshold      | < 0.6 m (wider zone) | < 0.5 m           |
-| Primary hazard type     | Overhead / head-height | Lateral / torso   |
-| Typical mounting height | ~170–190 cm          | ~90–110 cm        |
+### 7.1 Per-Module Processing (Parallel)
 
-Future extensions may apply different IMU compensation axes (e.g., head nodding
-vs body leaning) or different mmWave sensitivity settings per module.
+Each module's sensors are processed independently first:
+
+```
+ Head module data        Body module data
+       │                       │
+  _fuse_sensor_data       _fuse_sensor_data
+  (head thresholds)       (body thresholds)
+       │                       │
+  _apply_imu_compensation _apply_imu_compensation
+  (head IMU only)         (body IMU only)
+       │                       │
+  head_fused[8 dirs]      body_fused[8 dirs]
+```
+
+Applying each module's IMU independently ensures that a tilted body cannot
+suppress valid head readings, and a tilted head cannot mask a body hazard.
+
+### 7.2 Cross-Module Merge (Safety-First)
+
+For every direction the closer (more dangerous) distance from either module
+wins:
+
+```
+for each direction:
+    dist_head = head_fused[direction].distance_m
+    dist_body = body_fused[direction].distance_m
+
+    if both are valid:
+        effective = min(dist_head, dist_body)   # safety-first
+    elif only head is valid:
+        effective = dist_head
+    elif only body is valid:
+        effective = dist_body
+    else:
+        effective = None  (CLEAR)
+
+    # Always reclassify with head thresholds because
+    # the output motors are mounted on the head.
+    zone = classify(effective, module="head")
+```
+
+### 7.3 Why Always Head Thresholds After Merge?
+
+| Feature                | `"head"` threshold | `"body"` threshold |
+|------------------------|---------------------|--------------------|
+| CRITICAL boundary      | < 0.6 m (wider)     | < 0.5 m            |
+| Typical mount height   | ~175–190 cm         | ~90–110 cm         |
+
+Once the worst distance per direction is known, the output belongs to the
+head motors, so head thresholds define the final zone.  A body-detected
+obstacle at 0.55 m will produce CRITICAL on the head motors even though the
+body fusion alone would have produced DANGER — this is intentional and
+conservative.
 
 ---
 
@@ -276,36 +331,57 @@ ESP32 BODY                   │  6. Generate motor commands   │  ESP32 BODY
 
 ### 9.1 Request  `POST /nav`
 
+Each module sends its own packet independently.  The server merges the latest
+packet from each module on every call.
+
+**Head module packet:**
 ```json
 {
   "device_id":  "esp32_head",
   "module":     "head",
 
   "tof_sensors": {
-    "front":       {"distance_mm": 1200, "avg": 1200, "min": 1100, "max": 1300, "count": 50},
-    "front_right": {"distance_mm": 2500, "avg": 2500, "min": 2480, "max": 2520, "count": 50},
-    "right":       {"distance_mm":  800, "avg":  800, "min":  790, "max":  810, "count": 50},
-    "back_right":  {"distance_mm": 3000, "avg": 3000, "min": 2990, "max": 3010, "count": 50},
+    "front":       {"distance_mm": 450, "avg": 450, "min": 440, "max": 460, "count": 50},
+    "front_right": {"distance_mm": 8190, "avg": 8190, "min": 8190, "max": 8190, "count": 50},
+    "right":       {"distance_mm": 8190, "avg": 8190, "min": 8190, "max": 8190, "count": 50},
+    "back_right":  {"distance_mm": 8190, "avg": 8190, "min": 8190, "max": 8190, "count": 50},
     "back":        {"distance_mm": 8190, "avg": 8190, "min": 8190, "max": 8190, "count": 50},
     "back_left":   {"distance_mm": 8190, "avg": 8190, "min": 8190, "max": 8190, "count": 50},
-    "left":        {"distance_mm":  600, "avg":  600, "min":  590, "max":  610, "count": 50},
-    "front_left":  {"distance_mm": 1800, "avg": 1800, "min": 1790, "max": 1810, "count": 50}
+    "left":        {"distance_mm": 8190, "avg": 8190, "min": 8190, "max": 8190, "count": 50},
+    "front_left":  {"distance_mm": 8190, "avg": 8190, "min": 8190, "max": 8190, "count": 50}
   },
-
   "mmwave_sensors": {
-    "front": {"targets": 1, "range_m": 7.5, "speed_ms": 0.11, "energy": 10576},
-    "back":  {"targets": 0, "range_m": 0.0, "speed_ms": 0.0,  "energy": 0}
+    "front": {"targets": 0, "range_m": 0.0, "speed_ms": 0.0, "energy": 0},
+    "back":  {"targets": 0, "range_m": 0.0, "speed_ms": 0.0, "energy": 0}
   },
+  "imu": {"roll_deg": 0.0, "pitch_deg": 0.0, "yaw_deg": 0.0,
+          "accel_x": 0.0, "accel_y": 0.0, "accel_z": 9.81},
+  "timestamp": 37400
+}
+```
 
-  "imu": {
-    "roll_deg":  2.5,
-    "pitch_deg": -1.2,
-    "yaw_deg":   45.0,
-    "accel_x":   0.01,
-    "accel_y":   0.02,
-    "accel_z":   9.8
+**Body module packet** (sent separately, any order):
+```json
+{
+  "device_id":  "esp32_body",
+  "module":     "body",
+
+  "tof_sensors": {
+    "front":       {"distance_mm": 8190, "avg": 8190, "min": 8190, "max": 8190, "count": 50},
+    "front_right": {"distance_mm": 8190, "avg": 8190, "min": 8190, "max": 8190, "count": 50},
+    "right":       {"distance_mm": 8190, "avg": 8190, "min": 8190, "max": 8190, "count": 50},
+    "back_right":  {"distance_mm": 8190, "avg": 8190, "min": 8190, "max": 8190, "count": 50},
+    "back":        {"distance_mm": 8190, "avg": 8190, "min": 8190, "max": 8190, "count": 50},
+    "back_left":   {"distance_mm": 8190, "avg": 8190, "min": 8190, "max": 8190, "count": 50},
+    "left":        {"distance_mm": 1100, "avg": 1100, "min": 1090, "max": 1110, "count": 50},
+    "front_left":  {"distance_mm": 8190, "avg": 8190, "min": 8190, "max": 8190, "count": 50}
   },
-
+  "mmwave_sensors": {
+    "front": {"targets": 0, "range_m": 0.0, "speed_ms": 0.0, "energy": 0},
+    "back":  {"targets": 1, "range_m": 9.0, "speed_ms": 0.05, "energy": 3200}
+  },
+  "imu": {"roll_deg": 0.0, "pitch_deg": 0.0, "yaw_deg": 0.0,
+          "accel_x": 0.0, "accel_y": 0.0, "accel_z": 9.81},
   "timestamp": 37393
 }
 ```
@@ -316,58 +392,67 @@ ESP32 BODY                   │  6. Generate motor commands   │  ESP32 BODY
   Value `8190` indicates no target detected (sensor sentinel).
 - `mmwave_sensors.{front,back}.targets`: number of detected targets. `0` = clear.
 - `imu.accel_z` ≈ 9.81 m/s² at rest (gravity).
-- `timestamp`: ESP32 `millis()` value (milliseconds since boot), used for latency measurement.
+- `timestamp`: ESP32 `millis()` value (ms since boot), used for latency measurement.
 
 ### 9.2 Response  `POST /nav`
+
+The response is **always** returned to whichever module sent the most recent
+packet; `module` is always `"combined"` in the response.
+
+Continuing the example above (body packet arrives after head packet; latest
+head data has 0.45 m front obstacle; body data has 1.1 m left obstacle +
+back mmWave at 9 m):
 
 ```json
 {
   "status":    "ok",
-  "device_id": "esp32_head",
-  "module":    "head",
+  "device_id": "esp32_body",
+  "module":    "combined",
 
   "hazard": {
-    "level":  3,
-    "label":  "WARNING",
+    "level":  5,
+    "label":  "CRITICAL",
     "alerts": [
-      {"direction": "right",      "zone": "WARNING", "distance_m": 1.8, "source": "tof"},
-      {"direction": "front",      "zone": "ALERT",   "distance_m": 7.5, "source": "mmwave"},
-      {"direction": "front_left", "zone": "ALERT",   "distance_m": 7.5, "source": "mmwave"},
-      {"direction": "front_right","zone": "ALERT",   "distance_m": 7.5, "source": "mmwave"}
+      {"direction": "front",     "zone": "CRITICAL", "distance_m": 0.45, "source": "tof"},
+      {"direction": "left",      "zone": "DANGER",   "distance_m": 1.1,  "source": "tof"},
+      {"direction": "back",      "zone": "ALERT",    "distance_m": 9.0,  "source": "mmwave"},
+      {"direction": "back_left", "zone": "ALERT",    "distance_m": 9.0,  "source": "mmwave"},
+      {"direction": "back_right","zone": "ALERT",    "distance_m": 9.0,  "source": "mmwave"}
     ]
   },
 
   "motors": [
-    {"motor_id": 0, "direction": "front",       "intensity": 51,  "frequency_hz": 2,
-     "pattern": "very_slow",   "active": true,  "zone": "ALERT",   "distance_m": 7.5, "source": "mmwave"},
-    {"motor_id": 1, "direction": "front_right", "intensity": 51,  "frequency_hz": 2,
-     "pattern": "very_slow",   "active": true,  "zone": "ALERT",   "distance_m": 7.5, "source": "mmwave"},
-    {"motor_id": 2, "direction": "right",       "intensity": 153, "frequency_hz": 10,
-     "pattern": "medium_pulse","active": true,  "zone": "WARNING", "distance_m": 1.8, "source": "tof"},
-    {"motor_id": 3, "direction": "back_right",  "intensity": 0,   "frequency_hz": 0,
-     "pattern": "off",         "active": false, "zone": "CLEAR",   "distance_m": null,"source": "none"},
-    {"motor_id": 4, "direction": "back",        "intensity": 0,   "frequency_hz": 0,
-     "pattern": "off",         "active": false, "zone": "CLEAR",   "distance_m": null,"source": "none"},
-    {"motor_id": 5, "direction": "back_left",   "intensity": 0,   "frequency_hz": 0,
-     "pattern": "off",         "active": false, "zone": "CLEAR",   "distance_m": null,"source": "none"},
-    {"motor_id": 6, "direction": "left",        "intensity": 0,   "frequency_hz": 0,
-     "pattern": "off",         "active": false, "zone": "CLEAR",   "distance_m": null,"source": "none"},
-    {"motor_id": 7, "direction": "front_left",  "intensity": 51,  "frequency_hz": 2,
-     "pattern": "very_slow",   "active": true,  "zone": "ALERT",   "distance_m": 7.5, "source": "mmwave"}
+    {"motor_id": 0, "direction": "front",       "intensity": 255, "frequency_hz": 50,
+     "pattern": "continuous",  "active": true,  "zone": "CRITICAL", "distance_m": 0.45, "source": "tof"},
+    {"motor_id": 1, "direction": "front_right",  "intensity": 0,   "frequency_hz": 0,
+     "pattern": "off",         "active": false, "zone": "CLEAR",    "distance_m": null, "source": "none"},
+    {"motor_id": 2, "direction": "right",        "intensity": 0,   "frequency_hz": 0,
+     "pattern": "off",         "active": false, "zone": "CLEAR",    "distance_m": null, "source": "none"},
+    {"motor_id": 3, "direction": "back_right",   "intensity": 51,  "frequency_hz": 2,
+     "pattern": "very_slow",   "active": true,  "zone": "ALERT",   "distance_m": 9.0,  "source": "mmwave"},
+    {"motor_id": 4, "direction": "back",         "intensity": 51,  "frequency_hz": 2,
+     "pattern": "very_slow",   "active": true,  "zone": "ALERT",   "distance_m": 9.0,  "source": "mmwave"},
+    {"motor_id": 5, "direction": "back_left",    "intensity": 51,  "frequency_hz": 2,
+     "pattern": "very_slow",   "active": true,  "zone": "ALERT",   "distance_m": 9.0,  "source": "mmwave"},
+    {"motor_id": 6, "direction": "left",         "intensity": 204, "frequency_hz": 20,
+     "pattern": "rapid_pulse", "active": true,  "zone": "DANGER",  "distance_m": 1.1,  "source": "tof"},
+    {"motor_id": 7, "direction": "front_left",   "intensity": 0,   "frequency_hz": 0,
+     "pattern": "off",         "active": false, "zone": "CLEAR",   "distance_m": null, "source": "none"}
   ],
 
-  "imu":        {"roll_deg": 2.5, "pitch_deg": -1.2, "yaw_deg": 45.0},
-  "latency_ms": 12.4
+  "imu":        {"roll_deg": 0.0, "pitch_deg": 0.0, "yaw_deg": 0.0},
+  "latency_ms": 7.0
 }
 ```
 
 **Field notes:**
-- `hazard.level`: 0 (CLEAR) → 5 (CRITICAL).  Use this as a quick summary.
+- `module`: always `"combined"` — the output is a fusion of both modules.
+- `hazard.level`: 0 (CLEAR) → 5 (CRITICAL).  Use as a quick severity summary.
 - `hazard.alerts`: sorted most-critical first; contains only non-CLEAR directions.
-- `motors[i].source`: `"tof"` | `"mmwave"` | `"tof+mmwave"` | `"none"` | `"suppressed(tilt)"`.
+- `motors[i].source`: `"tof"` | `"mmwave"` | `"tof+mmwave"` | `"none"` | `"suppressed(pitch_tilt)"` | `"suppressed(roll_tilt)"`.
 - `motors[i].distance_m`: `null` when no obstacle detected or channel suppressed.
-- `latency_ms`: server receipt time minus `timestamp`; useful for diagnosing
-  Wi-Fi lag.
+- `imu`: echoes the **head** module's IMU (the output device).
+- `latency_ms`: server receipt time minus the latest timestamp from either module.
 
 ### 9.3  `GET /status`
 
@@ -377,13 +462,13 @@ ESP32 BODY                   │  6. Generate motor commands   │  ESP32 BODY
   "devices": {
     "esp32_head": {
       "module":       "head",
-      "last_zone":    "WARNING",
+      "last_zone":    "CRITICAL",
       "packet_count": 142,
       "last_seen_ms": 1712678400000
     },
     "esp32_body": {
       "module":       "body",
-      "last_zone":    "CLEAR",
+      "last_zone":    "CRITICAL",
       "packet_count": 140,
       "last_seen_ms": 1712678400050
     }
@@ -391,52 +476,186 @@ ESP32 BODY                   │  6. Generate motor commands   │  ESP32 BODY
 }
 ```
 
----
-
-## 10. Algorithm State Machine (Per Direction)
-
-```
-              ┌──────────────────────────────────────────────────────┐
-  Packet      │            Hybrid Fusion Decision                    │
-  arrives     │                                                      │
-─────────────▶│  ToF valid?  ──Yes──▶  mmWave covers & detected?   │
-              │      │                   ──Yes──▶  min(ToF, mWave)  │
-              │      │                   ──No───▶  ToF only         │
-              │      No                                              │
-              │      │                                              │
-              │      └──────▶  mmWave covers & detected?           │
-              │                   ──Yes──▶  mmWave only             │
-              │                   ──No───▶  CLEAR                   │
-              └──────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-              ┌──────────────────────────────────────────────────────┐
-              │              IMU Compensation                        │
-              │  |pitch| > 15° → zero out front / back              │
-              │  |roll|  > 15° → zero out left / right              │
-              └──────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-              ┌──────────────────────────────────────────────────────┐
-              │           Zone Classification                        │
-              │  d < 0.4 m (head) or 0.5 m (body) → CRITICAL        │
-              │  d < 1.5 m                         → DANGER          │
-              │  d < 3.0 m                         → WARNING         │
-              │  d < 5.0 m                         → CAUTION         │
-              │  d < 12.0 m                        → ALERT           │
-              │  d ≥ 12.0 m or no reading          → CLEAR           │
-              └──────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-              ┌──────────────────────────────────────────────────────┐
-              │           Motor PWM Command                          │
-              │  intensity (0–255) + frequency_hz + pattern tag      │
-              └──────────────────────────────────────────────────────┘
-```
+> Note: `last_zone` in `/status` reflects the combined hazard label from the
+> most recent fusion result, not an individual module zone.
 
 ---
 
-## 11. Running the Server
+## 10. Algorithm State Machine
+
+```
+  HEAD packet            BODY packet
+       │                      │
+       ▼                      ▼
+┌─────────────┐        ┌─────────────┐
+│  Parse ToF  │        │  Parse ToF  │
+│  Parse mWave│        │  Parse mWave│
+│  Parse IMU  │        │  Parse IMU  │
+└──────┬──────┘        └──────┬──────┘
+       │                      │
+       ▼                      ▼
+┌─────────────┐        ┌─────────────┐
+│ Hybrid Fuse │        │ Hybrid Fuse │
+│ (per-dir    │        │ (per-dir    │
+│  min rule)  │        │  min rule)  │
+└──────┬──────┘        └──────┬──────┘
+       │                      │
+       ▼                      ▼
+┌─────────────┐        ┌─────────────┐
+│ Head IMU    │        │ Body IMU    │
+│ compensation│        │ compensation│
+│ (head only) │        │ (body only) │
+└──────┬──────┘        └──────┬──────┘
+       │                      │
+       └──────────┬───────────┘
+                  ▼
+    ┌─────────────────────────┐
+    │  Cross-Module Merge     │
+    │  for each direction:    │
+    │   effective =           │
+    │    min(head, body)      │
+    │  (safety-first)         │
+    └────────────┬────────────┘
+                 │
+                 ▼
+    ┌─────────────────────────┐
+    │  Zone Classification    │
+    │  (always head thresholds│
+    │   — output is head-only)│
+    │  d < 0.6 m → CRITICAL   │
+    │  d < 1.5 m → DANGER     │
+    │  d < 3.0 m → WARNING    │
+    │  d < 5.0 m → CAUTION    │
+    │  d < 12.0 m → ALERT     │
+    │  d ≥ 12.0 m → CLEAR     │
+    └────────────┬────────────┘
+                 │
+                 ▼
+    ┌─────────────────────────┐
+    │  8 Motor PWM Commands   │
+    │  (sent to head only)    │
+    └─────────────────────────┘
+```
+
+---
+
+## 11. Worked Example — Combined Dual-Module Decision
+
+This section traces a single real-world moment through the entire algorithm
+so the combined logic is visible at every step.
+
+### Scenario
+
+The user is walking down a hallway:
+- A **doorframe** is 45 cm ahead at head height  (only the head module sees it).
+- A **chair** is 1.1 m to the left at waist height  (only the body module sees it).
+- A **person** is approaching from behind, 9 m away  (body mmWave detects them).
+- The head module is **slightly tilted** forward: `pitch = 20°` (looking down).
+
+### Step 1 — Head Module Parses Its Own Sensors
+
+```
+Head ToF readings (after sentinel + range filtering):
+  front:       0.45 m   ← doorframe at head height
+  all others:  None     ← no target
+
+Head mmWave:
+  front:  None (targets = 0)
+  back:   None (targets = 0)
+
+Head IMU: pitch = +20°, roll = 0°
+```
+
+### Step 2 — Body Module Parses Its Own Sensors
+
+```
+Body ToF readings:
+  left:        1.10 m   ← chair leg
+  all others:  None     ← no target
+
+Body mmWave:
+  front:  None (targets = 0)
+  back:   range_m = 9.0 m  (person approaching)
+
+Body IMU: pitch = 0°, roll = 0°  (body is upright)
+```
+
+### Step 3 — Per-Module Hybrid Sensor Fusion
+
+```
+Head fused per direction  (using head thresholds internally):
+  front:        dist=0.45 m, source="tof",    zone=CRITICAL
+  all others:   dist=None,   source="none",   zone=CLEAR
+
+Body fused per direction  (using body thresholds internally):
+  left:         dist=1.10 m, source="tof",    zone=DANGER
+  back:         dist=9.0 m,  source="mmwave", zone=ALERT
+  back_left:    dist=9.0 m,  source="mmwave", zone=ALERT   ← mmWave cone
+  back_right:   dist=9.0 m,  source="mmwave", zone=ALERT   ← mmWave cone
+  all others:   dist=None,   source="none",   zone=CLEAR
+```
+
+### Step 4 — IMU Compensation (Applied per Module Independently)
+
+```
+Head IMU: |pitch| = 20° > 15° threshold
+  → suppress head["front"]:   zone=CLEAR, source="suppressed(pitch_tilt)"
+  → suppress head["back"]:    (already CLEAR, no change)
+
+Body IMU: |pitch| = 0°, |roll| = 0°  →  no suppression
+```
+
+After compensation:
+```
+Head fused:     front → CLEAR (suppressed!),  all others → CLEAR
+Body fused:     left → DANGER, back/back_left/back_right → ALERT
+```
+
+> The head was pointing at the ground and would have produced a false
+> 45 cm reading from the floor.  Suppression removes it correctly.
+
+### Step 5 — Cross-Module Merge (min per direction, head thresholds)
+
+```
+Direction   Head dist   Body dist   Effective   Head zone
+─────────────────────────────────────────────────────────
+front       None*       None        None        CLEAR        * suppressed
+front_right None        None        None        CLEAR
+right       None        None        None        CLEAR
+back_right  None        9.0 m       9.0 m       ALERT
+back        None        9.0 m       9.0 m       ALERT
+back_left   None        9.0 m       9.0 m       ALERT
+left        None        1.10 m      1.10 m      DANGER
+front_left  None        None        None        CLEAR
+```
+
+### Step 6 — Final Motor Commands (sent to head module)
+
+```
+Motor 0  front       → OFF   (CLEAR)
+Motor 1  front_right → OFF   (CLEAR)
+Motor 2  right       → OFF   (CLEAR)
+Motor 3  back_right  → ON    intensity=51, 2 Hz, very_slow   (ALERT)
+Motor 4  back        → ON    intensity=51, 2 Hz, very_slow   (ALERT)
+Motor 5  back_left   → ON    intensity=51, 2 Hz, very_slow   (ALERT)
+Motor 6  left        → ON    intensity=204, 20 Hz, rapid_pulse (DANGER)
+Motor 7  front_left  → OFF   (CLEAR)
+```
+
+**Hazard summary:** `level=4, label="DANGER"` (worst non-suppressed zone)
+
+### Key Observations from This Example
+
+| Observation | Why it works |
+|---|---|
+| Head CRITICAL suppressed by its own pitch tilt | IMU per-module: body's upright IMU doesn't accidentally un-suppress the head |
+| Body chair (1.1 m left) reaches the head motors | Cross-module merge: body hazards propagate to head output |
+| Back mmWave cone covers 3 directions | Single radar detection → back, back_left, back_right all vibrate |
+| Head thresholds apply to the merged result | Final zones always use 0.6 m CRITICAL boundary, not 0.5 m body boundary |
+
+---
+
+## 12. Running the Server
 
 ```bash
 # Install dependencies
@@ -451,7 +670,7 @@ pytest tests/ -v
 
 ---
 
-## 12. ESP32 Firmware Integration Notes
+## 13. ESP32 Firmware Integration Notes
 
 1. Populate **all 8** `tof_sensors` fields on every packet.  Use the sentinel
    value `{"distance_mm": 8190, "avg": 8190, ...}` for sensors that return

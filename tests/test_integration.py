@@ -24,13 +24,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import json
 import pytest
 
-from server import app, device_state
+from server import app, device_state, latest_module_data, combined_state
 from algorithm import (
     DIRECTIONS,
     NUM_DIRECTIONS,
     MMWAVE_COVERAGE,
     TILT_THRESHOLD_DEG,
     Zone,
+    fresh_device_state,
 )
 
 
@@ -43,6 +44,10 @@ def client():
     """Flask test client with a clean device-state between tests."""
     app.config["TESTING"] = True
     device_state.clear()
+    latest_module_data["head"] = {}
+    latest_module_data["body"] = {}
+    combined_state.clear()
+    combined_state.update(fresh_device_state())
     with app.test_client() as c:
         yield c
 
@@ -170,7 +175,7 @@ class TestNavHeadModule:
 
     def test_module_is_head(self, client):
         data = _post_nav(client, _base_packet("head")).get_json()
-        assert data["module"] == "head"
+        assert data["module"] == "combined"
 
     def test_head_all_clear(self, client):
         data = _post_nav(client, _base_packet("head")).get_json()
@@ -188,23 +193,19 @@ class TestNavHeadModule:
         assert m["intensity"] == 255
         assert m["active"]    is True
 
-    def test_head_tighter_critical_threshold(self, client):
-        """0.55 m → CRITICAL for head (< 0.6 m threshold) but DANGER for body (>= 0.5 m)."""
-        pkt_head = _base_packet("head")
-        pkt_body = _base_packet("body")
-        for pkt in (pkt_head, pkt_body):
-            pkt["tof_sensors"]["front"] = {
-                "distance_mm": 550, "avg": 550, "min": 540, "max": 560, "count": 50
-            }
-
-        data_head = _post_nav(client, pkt_head).get_json()
-        data_body = _post_nav(client, pkt_body).get_json()
-
-        m_head = next(m for m in data_head["motors"] if m["direction"] == "front")
-        m_body = next(m for m in data_body["motors"] if m["direction"] == "front")
-
-        assert m_head["zone"] == Zone.CRITICAL
-        assert m_body["zone"] == Zone.DANGER
+    def test_combined_uses_head_thresholds(self, client):
+        """Combined output always applies head thresholds (0.6 m CRITICAL boundary).
+        0.55 m from the body module becomes CRITICAL, not DANGER, because the
+        merged decision is reclassified with the wider head threshold."""
+        pkt = _base_packet("body")
+        pkt["tof_sensors"]["front"] = {
+            "distance_mm": 550, "avg": 550, "min": 540, "max": 560, "count": 50
+        }
+        data = _post_nav(client, pkt).get_json()
+        m = next(m for m in data["motors"] if m["direction"] == "front")
+        # 0.55 m < 0.6 m head CRITICAL threshold → CRITICAL
+        # (would be DANGER under body’s 0.5 m threshold)
+        assert m["zone"] == Zone.CRITICAL
 
     def test_head_warning_side_obstacle(self, client):
         pkt = _base_packet("head")
@@ -233,7 +234,7 @@ class TestNavBodyModule:
 
     def test_module_is_body(self, client):
         data = _post_nav(client, _base_packet("body")).get_json()
-        assert data["module"] == "body"
+        assert data["module"] == "combined"
 
     def test_body_all_clear(self, client):
         data = _post_nav(client, _base_packet("body")).get_json()
@@ -265,7 +266,7 @@ class TestNavBodyModule:
         pkt = _base_packet("body")
         pkt["module"] = "waist"   # not a recognized value
         data = _post_nav(client, pkt).get_json()
-        assert data["module"] == "body"
+        assert data["module"] == "combined"
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +441,7 @@ class TestNavEdgeCases:
         pkt = _base_packet("body")
         del pkt["module"]
         data = _post_nav(client, pkt).get_json()
-        assert data["module"] == "body"
+        assert data["module"] == "combined"
 
     def test_missing_tof_sensors_all_clear(self, client):
         pkt = _base_packet()
@@ -460,8 +461,11 @@ class TestNavEdgeCases:
         data = _post_nav(client, pkt).get_json()
         assert data["status"] == "ok"
 
-    def test_two_separate_devices_independent_state(self, client):
-        """Packets from two devices must not share state."""
+    def test_two_modules_combined_hazard(self, client):
+        """In the combined architecture both modules share the fused result.
+        A hazard seen by the head module is reflected in the combined response
+        even when the body module subsequently sends an all-clear packet, and
+        per-device /status entries are tracked independently."""
         pkt_head = _base_packet("head")
         pkt_head["tof_sensors"]["front"] = {
             "distance_mm": 200, "avg": 200, "min": 190, "max": 210, "count": 50
@@ -471,8 +475,15 @@ class TestNavEdgeCases:
         _post_nav(client, pkt_head)
         data_body = _post_nav(client, pkt_body).get_json()
 
-        # body module should still be clear, unaffected by head packet
-        assert data_body["hazard"]["level"] == 0
+        # Combined fusion: head still reports 200 mm front obstacle → CRITICAL
+        assert data_body["hazard"]["label"] == Zone.CRITICAL
+        m_front = next(m for m in data_body["motors"] if m["direction"] == "front")
+        assert m_front["active"] is True
+
+        # Per-device /status entries are still tracked independently
+        status = client.get("/status").get_json()
+        assert status["devices"]["esp32_head"]["module"] == "head"
+        assert status["devices"]["esp32_body"]["module"] == "body"
 
     def test_consecutive_packets_increment_server_state(self, client):
         for _ in range(3):

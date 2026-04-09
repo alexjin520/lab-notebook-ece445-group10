@@ -62,9 +62,19 @@ Those directions are suppressed (set to CLEAR) to avoid false alarms.
 
 Module-specific Sensitivity
 ----------------------------
-  head  module: critical threshold tightened to 0.4 m  (head-height hazards
-                need a slightly earlier warning – awnings, signs, doorframes)
+  head  module: critical threshold widened to 0.6 m  (head-height hazards
+                need an earlier warning – awnings, signs, doorframes are
+                less visible at head height)
   body  module: standard thresholds
+
+Combined Dual-module Decision
+------------------------------
+  In the dual-module deployment both head and body packets are fused:
+  1. Each module's IMU suppresses its own tilted sensor channels first.
+  2. For every direction the closer distance from either module is used
+     (safety-first minimum across head and body readings).
+  3. Head thresholds classify the merged result because the output motors
+     are physically mounted on the head module only.
 """
 
 from __future__ import annotations
@@ -574,6 +584,116 @@ def process_packet(data: dict[str, Any], state: dict, now_ms: float) -> dict:
         },
         "latency_ms": latency_ms,
     }
+
+
+def process_combined_packet(
+    head_data: dict[str, Any],
+    body_data: dict[str, Any],
+    state: dict,
+    now_ms: float,
+) -> dict:
+    """
+    Fuse sensor data from both the HEAD and BODY modules simultaneously and
+    produce a single set of motor commands for the head module.
+
+    Each module's IMU is applied to suppress its own tilted sensor channels
+    before cross-module merging, so a tilted body cannot mute valid head
+    readings, and vice-versa.  The final zone classification always uses
+    head thresholds because the output motors are on the head.
+
+    Parameters
+    ----------
+    head_data : Latest parsed JSON packet from the head module (or ``{}``).
+    body_data : Latest parsed JSON packet from the body module (or ``{}``).
+    state     : Mutable combined persistent state dict kept by the server.
+    now_ms    : Current server time in milliseconds (for latency measurement).
+    """
+    # ── 1. Parse each module's sensors independently ─────────────────────────
+    head_tof    = _parse_tof_sensors(head_data.get("tof_sensors", {}))
+    body_tof    = _parse_tof_sensors(body_data.get("tof_sensors", {}))
+    head_mmwave = _parse_mmwave_sensors(head_data.get("mmwave_sensors", {}))
+    body_mmwave = _parse_mmwave_sensors(body_data.get("mmwave_sensors", {}))
+    head_imu    = _parse_imu(head_data.get("imu", {}))
+    body_imu    = _parse_imu(body_data.get("imu", {}))
+
+    # ── 2. Fuse and apply per-module IMU compensation ─────────────────────────
+    #   Each module's tilt suppresses only its own readings, keeping the two
+    #   modules independent before the cross-module merge.
+    head_fused = _fuse_sensor_data(head_tof, head_mmwave, module="head")
+    head_fused = _apply_imu_compensation(head_fused, head_imu)
+
+    body_fused = _fuse_sensor_data(body_tof, body_mmwave, module="body")
+    body_fused = _apply_imu_compensation(body_fused, body_imu)
+
+    # ── 3. Merge: safety-first min across both modules; head thresholds ───────
+    fused = _merge_fused_dicts(head_fused, body_fused)
+
+    # ── 4. Generate outputs ───────────────────────────────────────────────────
+    motors = _generate_motor_commands(fused)
+    hazard = _compute_hazard(fused)
+
+    # ── 5. Update combined persistent state ──────────────────────────────────
+    state["last_seen_ms"]  = now_ms
+    state["packet_count"] += 1
+    state["last_zone"]     = hazard["label"]
+    state["module"]        = "combined"
+
+    # Latency relative to the most recent timestamp from either module
+    ts = max(int(head_data.get("timestamp", 0)), int(body_data.get("timestamp", 0)))
+    latency_ms = round(now_ms - ts, 1) if ts else 0.0
+
+    return {
+        "module":     "combined",
+        "hazard":     hazard,
+        "motors":     motors,
+        "imu":        {
+            "roll_deg":  head_imu["roll_deg"],
+            "pitch_deg": head_imu["pitch_deg"],
+            "yaw_deg":   head_imu["yaw_deg"],
+        },
+        "latency_ms": latency_ms,
+    }
+
+
+def _merge_fused_dicts(
+    fused_a: dict[str, dict],
+    fused_b: dict[str, dict],
+) -> dict[str, dict]:
+    """
+    Merge two already-IMU-compensated fused direction dicts.
+
+    For each direction the closer (more dangerous) distance wins.  After
+    merging all zones are reclassified with head thresholds because the
+    combined motor output is intended for the head module.
+    """
+    merged: dict[str, dict] = {}
+    for direction in DIRECTIONS:
+        a, b     = fused_a[direction], fused_b[direction]
+        dist_a   = a["distance_m"]
+        dist_b   = b["distance_m"]
+
+        if dist_a is not None and dist_b is not None:
+            eff_dist = min(dist_a, dist_b)
+            source   = a["source"] if dist_a <= dist_b else b["source"]
+        elif dist_a is not None:
+            eff_dist, source = dist_a, a["source"]
+        elif dist_b is not None:
+            eff_dist, source = dist_b, b["source"]
+        else:
+            eff_dist = None
+            # Preserve suppression annotation if either module suppressed the channel
+            source = a["source"] if "suppressed" in a["source"] else b["source"]
+
+        # Reclassify with head thresholds – output is always for the head motors
+        zone    = classify_distance(eff_dist, module="head") if eff_dist is not None else Zone.CLEAR
+        pattern = VIBRATION_PATTERNS[zone].copy()
+        merged[direction] = {
+            "distance_m": eff_dist,
+            "source":     source,
+            "zone":       zone,
+            "vibration":  pattern,
+        }
+    return merged
 
 
 def print_decision(

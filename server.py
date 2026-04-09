@@ -63,12 +63,18 @@ from flask import Flask, request, jsonify
 from collections import defaultdict
 import time
 
-from algorithm import process_packet, print_decision, fresh_device_state
+from algorithm import process_combined_packet, print_decision, fresh_device_state
 
 app = Flask(__name__)
 
 # Per-device persistent state (keyed by device_id string, auto-initialised)
 device_state: defaultdict = defaultdict(fresh_device_state)
+
+# Latest raw packet from each module type; both are merged on every /nav call
+latest_module_data: dict = {"head": {}, "body": {}}
+
+# Persistent state for the combined dual-module fusion result
+combined_state: dict = fresh_device_state()
 
 
 @app.route("/nav", methods=["POST"])
@@ -81,7 +87,26 @@ def nav():
     pkt_ts    = int(data.get("timestamp", 0))
     now       = time.time() * 1000.0
 
-    result = process_packet(data, device_state[device_id], now)
+    # Identify and cache this module's latest sensor data
+    module = str(data.get("module", "body")).lower()
+    if module not in ("head", "body"):
+        module = "body"
+    latest_module_data[module] = data
+
+    # Dual-module fusion – motor output is always for the head
+    result = process_combined_packet(
+        latest_module_data["head"],
+        latest_module_data["body"],
+        combined_state,
+        now,
+    )
+
+    # Update per-device state for /status tracking
+    dev = device_state[device_id]
+    dev["module"]        = module
+    dev["last_seen_ms"]  = now
+    dev["packet_count"] += 1
+    dev["last_zone"]     = result["hazard"]["label"]
 
     print_decision(
         result["hazard"]["alerts"],
