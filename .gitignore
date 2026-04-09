@@ -3,3 +3,6 @@ __pycache__
 ECE445_group10_design.pdf
 tests/__pycache__
 logs/
+
+# API keys – never commit the real config, only the example template
+frontend/config.js
