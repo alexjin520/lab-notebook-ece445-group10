@@ -79,8 +79,13 @@ Combined Dual-module Decision
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any
+
+# Library-style: attach NullHandler so callers control output
+logging.getLogger("omnisense").addHandler(logging.NullHandler())
+logger = logging.getLogger("omnisense.algorithm")
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +222,14 @@ def _parse_tof_sensors(tof_data: dict) -> dict[str, float | None]:
         else:
             dist_m = raw_mm / 1000.0
             result[direction] = dist_m if dist_m <= TOF_MAX_RANGE_M else None
+
+    logger.debug(
+        "[VERIFY:TOF_RAW] %s",
+        "  ".join(
+            f"{d}={v:.3f}m" if v is not None else f"{d}=None"
+            for d, v in result.items()
+        ),
+    )
     return result
 
 
@@ -249,6 +262,16 @@ def _parse_mmwave_sensors(mmwave_data: dict) -> dict[str, dict | None]:
                 "speed_ms": float(reading.get("speed_ms", 0.0)),
                 "energy":   int(reading.get("energy", 0)),
             }
+
+    for sid in ("front", "back"):
+        v = result[sid]
+        if v is not None:
+            logger.debug(
+                "[VERIFY:MMWAVE_RAW] sensor=%-5s target=yes range_m=%.3f speed_ms=%.3f energy=%d",
+                sid, v["range_m"], v["speed_ms"], v["energy"],
+            )
+        else:
+            logger.debug("[VERIFY:MMWAVE_RAW] sensor=%-5s target=no", sid)
     return result
 
 
@@ -363,6 +386,11 @@ def _apply_imu_compensation(
     result = {k: dict(v) for k, v in fused.items()}  # shallow copy
 
     if abs(pitch) > TILT_THRESHOLD_DEG:
+        logger.info(
+            "[VERIFY:IMU_SUPPRESS] axis=pitch pitch_deg=%.2f threshold_deg=%.1f "
+            "suppressed=front,back  ← sensor pointing off-horizon, readings discarded",
+            pitch, TILT_THRESHOLD_DEG,
+        )
         for direction in ("front", "back"):
             result[direction].update({
                 "distance_m": None,
@@ -372,6 +400,11 @@ def _apply_imu_compensation(
             })
 
     if abs(roll) > TILT_THRESHOLD_DEG:
+        logger.info(
+            "[VERIFY:IMU_SUPPRESS] axis=roll  roll_deg=%.2f  threshold_deg=%.1f "
+            "suppressed=left,right  ← sensor pointing off-horizon, readings discarded",
+            roll, TILT_THRESHOLD_DEG,
+        )
         for direction in ("left", "right"):
             result[direction].update({
                 "distance_m": None,
@@ -477,6 +510,90 @@ def _compute_hazard(fused: dict[str, dict]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Internal logging helpers  (used by process_packet / process_combined_packet)
+# ---------------------------------------------------------------------------
+
+def _log_fused_directions(device_id: str, module: str, fused: dict[str, dict]) -> None:
+    """
+    Emit one DEBUG line per non-CLEAR direction after fusion+IMU compensation.
+
+    Each line carries enough context to verify 2.2.3 R1 (distance accuracy ≤±5%)
+    and 2.2.3 R2 (moving obstacle detection) from the log file.
+    """
+    for direction, reading in fused.items():
+        dist = reading["distance_m"]
+        zone = reading["zone"]
+        dist_str = f"{dist:.3f}m" if dist is not None else "  None "
+        logger.debug(
+            "[VERIFY:FUSE] device=%-20s module=%-8s dir=%-12s "
+            "eff_m=%7s source=%-14s zone=%s",
+            device_id, module, direction, dist_str, reading["source"], zone,
+        )
+
+
+def _log_hazard(device_id: str, module: str, hazard: dict) -> None:
+    """
+    Emit an INFO line whenever the fused hazard level is above CLEAR.
+
+    Supports verification of:
+      • 2.2.2 R1  – obstacle detection recall (presence/absence of HAZARD_DETECT)
+      • 2.2.2 R3  – direction classification accuracy (worst_dir field)
+      • 2.2.3 R2  – moving obstacle detection rate
+    """
+    if hazard["level"] == 0:
+        logger.debug(
+            "[VERIFY:HAZARD_DETECT] device=%-20s module=%-8s level=0 label=CLEAR",
+            device_id, module,
+        )
+        return
+
+    worst = hazard["alerts"][0]
+    logger.info(
+        "[VERIFY:HAZARD_DETECT] device=%-20s module=%-8s level=%d label=%-8s "
+        "worst_dir=%-12s dist_m=%s source=%-14s alert_count=%d",
+        device_id, module,
+        hazard["level"], hazard["label"],
+        worst["direction"],
+        f"{worst['distance_m']:.3f}" if worst["distance_m"] is not None else "None",
+        worst["source"],
+        len(hazard["alerts"]),
+    )
+    # Log every alert direction so the full confusion-matrix row is captured
+    for alert in hazard["alerts"]:
+        logger.debug(
+            "[VERIFY:HAZARD_ALERT] device=%-20s dir=%-12s zone=%-8s dist_m=%s source=%s",
+            device_id, alert["direction"], alert["zone"],
+            f"{alert['distance_m']:.3f}" if alert["distance_m"] is not None else "None",
+            alert["source"],
+        )
+
+
+def _log_active_motors(device_id: str, motors: list[dict]) -> None:
+    """
+    Emit one DEBUG line listing every active motor.
+
+    Used to build the confusion matrix for 2.2.1 R3 (cross-activation error <5%):
+    compare logged active motors against the commanded direction.
+    """
+    active = [m for m in motors if m["active"]]
+    if not active:
+        logger.debug(
+            "[VERIFY:MOTOR_CMD] device=%-20s active_count=0 all_motors=off",
+            device_id,
+        )
+        return
+    parts = [
+        f"{m['direction']}(id={m['motor_id']},zone={m['zone']},"
+        f"int={m['intensity']},freq={m['frequency_hz']}Hz)"
+        for m in active
+    ]
+    logger.info(
+        "[VERIFY:MOTOR_CMD] device=%-20s active_count=%d active=[%s]",
+        device_id, len(active), ", ".join(parts),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public interface (called by server.py)
 # ---------------------------------------------------------------------------
 
@@ -546,7 +663,8 @@ def process_packet(data: dict[str, Any], state: dict, now_ms: float) -> dict:
         }
     """
     # ── 1. Module identification ─────────────────────────────────────────────
-    module = str(data.get("module", "body")).lower()
+    module    = str(data.get("module", "body")).lower()
+    device_id = str(data.get("device_id", "unknown"))
     if module not in ("head", "body"):
         module = "body"  # safe default
 
@@ -555,15 +673,32 @@ def process_packet(data: dict[str, Any], state: dict, now_ms: float) -> dict:
     mmwave_detects = _parse_mmwave_sensors(data.get("mmwave_sensors", {}))
     imu            = _parse_imu(data.get("imu", {}))
 
+    # [VERIFY:IMU_READ] – continuous yaw log for 2.2.3 orientation drift check
+    logger.info(
+        "[VERIFY:IMU_READ] device=%-14s module=%-4s "
+        "roll=%7.2f  pitch=%7.2f  yaw=%7.2f  accel_z=%.3f",
+        device_id, module,
+        imu["roll_deg"], imu["pitch_deg"], imu["yaw_deg"], imu["accel_z"],
+    )
+
     # ── 3. Hybrid sensor fusion ──────────────────────────────────────────────
     fused = _fuse_sensor_data(tof_distances, mmwave_detects, module)
 
     # ── 4. IMU tilt compensation ─────────────────────────────────────────────
     fused = _apply_imu_compensation(fused, imu)
 
+    # [VERIFY:FUSE] – per-direction fusion result for 2.2.3 distance accuracy
+    _log_fused_directions(device_id, module, fused)
+
     # ── 5. Generate outputs ──────────────────────────────────────────────────
     motors = _generate_motor_commands(fused)
     hazard = _compute_hazard(fused)
+
+    # [VERIFY:HAZARD_DETECT] – direction + zone for 2.2.2 classification check
+    _log_hazard(device_id, module, hazard)
+
+    # [VERIFY:MOTOR_CMD] – active motors for cross-activation error check (2.2.1)
+    _log_active_motors(device_id, motors)
 
     # ── 6. Update persistent per-device state ────────────────────────────────
     state["last_seen_ms"]  = now_ms
@@ -608,6 +743,9 @@ def process_combined_packet(
     state     : Mutable combined persistent state dict kept by the server.
     now_ms    : Current server time in milliseconds (for latency measurement).
     """
+    head_id = str(head_data.get("device_id", "head"))
+    body_id = str(body_data.get("device_id", "body"))
+
     # ── 1. Parse each module's sensors independently ─────────────────────────
     head_tof    = _parse_tof_sensors(head_data.get("tof_sensors", {}))
     body_tof    = _parse_tof_sensors(body_data.get("tof_sensors", {}))
@@ -615,6 +753,22 @@ def process_combined_packet(
     body_mmwave = _parse_mmwave_sensors(body_data.get("mmwave_sensors", {}))
     head_imu    = _parse_imu(head_data.get("imu", {}))
     body_imu    = _parse_imu(body_data.get("imu", {}))
+
+    # [VERIFY:IMU_READ] – log both module IMUs for orientation drift analysis (2.2.3)
+    logger.info(
+        "[VERIFY:IMU_READ] device=%-14s module=head "
+        "roll=%7.2f  pitch=%7.2f  yaw=%7.2f  accel_z=%.3f",
+        head_id,
+        head_imu["roll_deg"], head_imu["pitch_deg"],
+        head_imu["yaw_deg"],  head_imu["accel_z"],
+    )
+    logger.info(
+        "[VERIFY:IMU_READ] device=%-14s module=body "
+        "roll=%7.2f  pitch=%7.2f  yaw=%7.2f  accel_z=%.3f",
+        body_id,
+        body_imu["roll_deg"], body_imu["pitch_deg"],
+        body_imu["yaw_deg"],  body_imu["accel_z"],
+    )
 
     # ── 2. Fuse and apply per-module IMU compensation ─────────────────────────
     #   Each module's tilt suppresses only its own readings, keeping the two
@@ -631,6 +785,15 @@ def process_combined_packet(
     # ── 4. Generate outputs ───────────────────────────────────────────────────
     motors = _generate_motor_commands(fused)
     hazard = _compute_hazard(fused)
+
+    # [VERIFY:FUSE] – merged per-direction result for distance accuracy check (2.2.3)
+    _log_fused_directions(f"{head_id}+{body_id}", "combined", fused)
+
+    # [VERIFY:HAZARD_DETECT] – direction + zone classification result (2.2.2)
+    _log_hazard(f"{head_id}+{body_id}", "combined", hazard)
+
+    # [VERIFY:MOTOR_CMD] – active motor set for cross-activation check (2.2.1)
+    _log_active_motors(f"{head_id}+{body_id}", motors)
 
     # ── 5. Update combined persistent state ──────────────────────────────────
     state["last_seen_ms"]  = now_ms
@@ -702,15 +865,21 @@ def print_decision(
     device_id: str,
     pkt_ts: int,
 ) -> None:
-    """Pretty-print the per-packet decision to stdout (debugging aid)."""
+    """Log the per-packet decision summary (replaces earlier print-based debug aid)."""
     _labels = {0: "CLEAR", 1: "ALERT", 2: "CAUTION",
                3: "WARNING", 4: "DANGER", 5: "CRITICAL"}
     label = _labels.get(level, "?")
-    print(f"[{pkt_ts:>8} ms]  {device_id}  hazard={label}({level})", end="")
     if alerts:
         parts = [
             f"{a['direction']}@{a['distance_m']}m({a['zone'][0]})"
             for a in alerts[:4]
         ]
-        print(f"  →  {', '.join(parts)}", end="")
-    print()
+        logger.info(
+            "[VERIFY:DECISION] pkt_ts=%8d ms  device=%-14s hazard=%s(%d)  → %s",
+            pkt_ts, device_id, label, level, ", ".join(parts),
+        )
+    else:
+        logger.info(
+            "[VERIFY:DECISION] pkt_ts=%8d ms  device=%-14s hazard=%s(%d)",
+            pkt_ts, device_id, label, level,
+        )
