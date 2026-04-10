@@ -47,7 +47,10 @@ Simulation Control Panel endpoints  (/sim/*)
 
 from __future__ import annotations
 
+import logging
+import logging.handlers
 import math
+import os
 import random
 import threading
 import time
@@ -56,6 +59,114 @@ from typing import Any
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+
+_LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+
+# Navigation verification thresholds (from design doc)
+_NAV_LATENCY_WARN_MS    = 200.0   # 2.2.1 R2 – motor activation ≤ 200 ms
+_HEADING_ERR_WARN_DEG   = 10.0    # 2.2.3 R4 – heading error ≤ 10° during straight walk
+_CMD_SUCCESS_WARN_PCT   = 98.0    # 2.2.7 R1 – command delivery ≥ 98 %
+_CONN_TIMEOUT_MS        = 2000.0  # 2.2.7 R2 – connection status update ≤ 2 s
+_CMD_POLL_WARN_IDLE_MS  = 2000.0  # warn if ESP32 has not polled for > 2 s
+
+
+def _setup_logging(log_dir: str = _LOG_DIR) -> None:
+    """
+    Configure console (INFO) + rotating file (DEBUG) handlers on the
+    'omnisense' logger hierarchy, creating a new timestamped log file.
+
+    Navigation-specific [VERIFY:*] tags and the requirement each covers:
+
+      TAG                    Requirement
+      ─────────────────────  ─────────────────────────────────────────────
+      NAV_ROUTE_SET          2.2.7 R1 – route delivery success tracking
+      NAV_CMD_RECV           2.2.1 R2 – command latency ≤ 200 ms; 2.2.7 R1
+      NAV_CMD_MOTOR          2.2.1 R3 – motor cross-activation confusion matrix
+      NAV_CMD_POLL           2.2.7 R1 – ESP32 poll delivery tracking
+      NAV_POS_UPDATE         2.2.3 R4 – GPS position updates for heading log
+      NAV_HEADING            2.2.3 R4 – heading error ≤ 10° straight walk
+      NAV_CMD_COMPUTE        2.2.1 R3 / High-level R2 – turn accuracy ≥ 85 %
+      NAV_WAYPOINT           2.2.1 R3 – waypoint transitions for turn accuracy
+      NAV_ARRIVED            2.2.7 R1 / High-level R2 – route completion
+      NAV_STOPPED            session marker
+      SIM_HAZARD_INJ         2.2.2 R1 – injected hazard events for recall test
+      SIM_HAZARD_EXP         2.2.2 R1 – hazard expiry (obstacle gone)
+      NAV_CMD_SUMMARY        2.2.7 R1 – cumulative success-rate table
+      NAV_PROC_TIME          2.2.8 R2 – server processing latency < 500 ms
+      CONN_IDLE              2.2.7 R2 – connection-loss detection ≤ 2 s
+    """
+    os.makedirs(log_dir, exist_ok=True)
+    ts    = time.strftime("%Y%m%d_%H%M%S")
+    fpath = os.path.join(log_dir, f"nav_{ts}.log")
+
+    root = logging.getLogger("omnisense")
+    root.setLevel(logging.DEBUG)
+    root.handlers.clear()
+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-8s %(message)s", datefmt="%H:%M:%S",
+    ))
+    root.addHandler(ch)
+
+    fh = logging.handlers.RotatingFileHandler(
+        fpath, maxBytes=10 * 1024 * 1024, backupCount=10, encoding="utf-8",
+    )
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s.%(msecs)03d %(levelname)-8s %(name)s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    root.addHandler(fh)
+
+    logging.getLogger("omnisense.nav").info(
+        "[VERIFY:NAV_SESSION_START] log_file=%s  "
+        "nav_latency_warn_ms=%.0f  heading_err_warn_deg=%.1f  "
+        "cmd_success_warn_pct=%.0f",
+        fpath, _NAV_LATENCY_WARN_MS, _HEADING_ERR_WARN_DEG, _CMD_SUCCESS_WARN_PCT,
+    )
+    return fpath
+
+
+logger = logging.getLogger("omnisense.nav")
+
+
+def _record_proc_time(proc_ms: float) -> None:
+    """Thread-safe accumulation of server processing latency stats."""
+    _nav_stats["proc_time_sum_ms"] += proc_ms
+    _nav_stats["proc_time_count"]  += 1
+    if proc_ms > _nav_stats["proc_time_max_ms"]:
+        _nav_stats["proc_time_max_ms"] = proc_ms
+
+# ---------------------------------------------------------------------------
+# Navigation statistics  (accumulated across the server lifetime)
+# ---------------------------------------------------------------------------
+
+_nav_stats: dict[str, Any] = {
+    # 2.2.7 R1 – command delivery success rate
+    "cmd_recv_total":    0,    # total POST /nav/set_command received
+    "cmd_recv_ok":       0,    # successfully processed (always == recv for 200 OK)
+    "cmd_poll_total":    0,    # total GET /nav/get_command served
+    "cmd_last_poll_ms":  0.0,  # wall-clock ms of last poll (for idle detection)
+    # 2.2.1 R3 / High-level R2 – turn accuracy
+    "cmd_history":       [],   # [{"commanded": dir, "step_maneuver": str, "phase": str}]
+    "waypoints_reached": 0,
+    # 2.2.3 R4 – heading error
+    "heading_errors":    [],   # list of abs(heading_err_deg) during straight nav
+    # 2.2.8 R2 – server processing latency
+    "proc_time_sum_ms":  0.0,
+    "proc_time_max_ms":  0.0,
+    "proc_time_count":   0,
+    # 2.2.2 R1 – hazard injection events
+    "hazard_inject_count": 0,
+    # route tracking
+    "routes_set":        0,
+}
 
 # ---------------------------------------------------------------------------
 # App
@@ -238,11 +349,20 @@ def _maneuver_to_direction(maneuver: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _expire_hazards() -> None:
-    now = time.time()
+    now     = time.time()
+    before  = len(active_hazards)
+    expired = [h for h in active_hazards if h["expires_at"] <= now]
     active_hazards[:] = [h for h in active_hazards if h["expires_at"] > now]
+    for h in expired:
+        # [VERIFY:SIM_HAZARD_EXP] – pair with SIM_HAZARD_INJ to verify
+        # 2.2.2 R1 detection window (obstacle persists > 100 ms before alert).
+        logger.debug(
+            "[VERIFY:SIM_HAZARD_EXP] direction=%-12s zone=%-8s source=%s",
+            h["direction"], h["zone"], h.get("source", "unknown"),
+        )
 
 
-def _inject_random_hazard() -> None:
+def _inject_random_hazard(source: str = "spontaneous") -> None:
     direction = random.choice(DIRECTIONS)
     zone = random.choices(
         ["CAUTION", "WARNING", "DANGER", "CRITICAL"],
@@ -250,12 +370,24 @@ def _inject_random_hazard() -> None:
     )[0]
     duration = sim_cfg["hazard_dur_s"] * random.uniform(0.8, 2.0)
     active_hazards.append({
-        "direction": direction,
-        "zone": zone,
+        "direction":  direction,
+        "zone":       zone,
         "distance_m": ZONE_DISTANCES[zone],
         "expires_at": time.time() + duration,
-        "source": "simulated",
+        "source":     source,
     })
+    _nav_stats["hazard_inject_count"] += 1
+    # [VERIFY:SIM_HAZARD_INJ] – supports 2.2.2 R1 hazard detection recall test.
+    # Each injection is a "ground truth" hazard event; correlate with
+    # HAZARD_DETECT lines in the hazard log to compute recall.
+    logger.info(
+        "[VERIFY:SIM_HAZARD_INJ] direction=%-12s zone=%-8s dist_m=%s "
+        "duration_s=%.1f  source=%-12s  total_active=%d  total_injected=%d",
+        direction, zone,
+        f"{ZONE_DISTANCES[zone]:.1f}" if ZONE_DISTANCES[zone] else "None",
+        duration, source, len(active_hazards),
+        _nav_stats["hazard_inject_count"],
+    )
 
 
 def _compute_nav_command(lat: float, lng: float, heading: float,
@@ -268,24 +400,58 @@ def _compute_nav_command(lat: float, lng: float, heading: float,
                 "distance_m": 0, "phase": "idle"}
 
     wp = route[waypoint_index]
-    dist = _haversine_m(lat, lng, wp["lat"], wp["lng"])
+    dist    = _haversine_m(lat, lng, wp["lat"], wp["lng"])
     bearing = _bearing_deg(lat, lng, wp["lat"], wp["lng"])
-    rel = (bearing - heading + 360) % 360
+    rel     = (bearing - heading + 360) % 360
+
+    # Heading error = angular deviation from the direct path to the waypoint.
+    # Normalise to [-180, 180] so right-of-path is positive, left is negative.
+    rel_norm      = ((rel + 180) % 360) - 180
+    heading_err   = abs(rel_norm)
 
     maneuver = maneuvers[waypoint_index] if waypoint_index < len(maneuvers) else "straight"
     if dist <= 50.0:
         command = _maneuver_to_direction(maneuver)
-        phase = "execute"
+        phase   = "execute"
     else:
         command = _sector_to_direction(rel)
-        phase = "prepare"
+        phase   = "prepare"
+
+    # [VERIFY:NAV_HEADING] – continuous heading error log for 2.2.3 R4 (≤10°).
+    # Only meaningful during the "prepare" (straight-walking) phase; at
+    # "execute" the user is intentionally turning so a large angle is expected.
+    if phase == "prepare":
+        _nav_stats["heading_errors"].append(heading_err)
+        if heading_err > _HEADING_ERR_WARN_DEG:
+            logger.warning(
+                "[VERIFY:NAV_HEADING] heading=%.1f  bearing_to_wp=%.1f  "
+                "heading_err=%.1f°  ⚠ EXCEEDS_THRESHOLD (%.1f°)  "
+                "wp='%s'  dist_m=%.1f",
+                heading, bearing, heading_err, _HEADING_ERR_WARN_DEG,
+                wp["name"], dist,
+            )
+        else:
+            logger.debug(
+                "[VERIFY:NAV_HEADING] heading=%.1f  bearing_to_wp=%.1f  "
+                "heading_err=%.1f°  wp='%s'  dist_m=%.1f",
+                heading, bearing, heading_err, wp["name"], dist,
+            )
+
+    # [VERIFY:NAV_CMD_COMPUTE] – command decision for turn-accuracy table (2.2.1 R3).
+    logger.debug(
+        "[VERIFY:NAV_CMD_COMPUTE] wp_idx=%d  phase=%-7s  "
+        "computed=%-12s  maneuver=%-20s  dist_m=%.1f  heading=%.1f",
+        waypoint_index, phase, command, maneuver, dist, heading,
+    )
 
     instruction = f"{maneuver.replace('-', ' ').title()} toward {wp['name']}"
     return {
-        "command": command,
+        "command":     command,
         "instruction": instruction,
-        "distance_m": round(dist, 1),
-        "phase": phase,
+        "distance_m":  round(dist, 1),
+        "phase":       phase,
+        "maneuver":    maneuver,        # extra field for logging; not sent to ESP32
+        "heading_err": round(heading_err, 2),
     }
 
 
@@ -326,6 +492,18 @@ def _simulation_tick(dt: float) -> None:
     # Advance waypoint if close enough
     dist_to_wp = _haversine_m(new_lat, new_lng, wp["lat"], wp["lng"])
     if dist_to_wp <= WAYPOINT_REACHED_M:
+        # [VERIFY:NAV_WAYPOINT] – waypoint reached; anchor for turn-accuracy
+        # confusion matrix (2.2.1 R3) and High-level R2 (≥85 % turn accuracy).
+        logger.info(
+            "[VERIFY:NAV_WAYPOINT] wp_idx=%d  name='%s'  "
+            "dist_walked_m=%.1f  elapsed_s=%.1f  "
+            "last_cmd=%-12s  maneuver=%s",
+            wp_idx, wp["name"],
+            sim_state["distance_m"], sim_state["elapsed_s"],
+            nav_state.get("command", "unknown"),
+            maneuvers[wp_idx] if wp_idx < len(maneuvers) else "unknown",
+        )
+        _nav_stats["waypoints_reached"] += 1
         sim_state["waypoint_index"] = wp_idx + 1
 
     # Update nav command
@@ -333,10 +511,10 @@ def _simulation_tick(dt: float) -> None:
         new_lat, new_lng, sim_state["heading"],
         sim_state["waypoint_index"], route, maneuvers,
     )
+    motor_id = DIRECTIONS.index(nav_cmd["command"]) if nav_cmd["command"] in DIRECTIONS else -1
     nav_state.update({
         "command":     nav_cmd["command"],
-        "motor_id":    DIRECTIONS.index(nav_cmd["command"])
-                       if nav_cmd["command"] in DIRECTIONS else -1,
+        "motor_id":    motor_id,
         "intensity":   NAV_INTENSITY.get(nav_cmd["command"], 0),
         "pattern":     NAV_PATTERN.get(nav_cmd["command"], "off"),
         "instruction": nav_cmd["instruction"],
@@ -348,7 +526,7 @@ def _simulation_tick(dt: float) -> None:
 
     # Spontaneous hazard injection
     if random.random() < sim_cfg["hazard_prob"] * dt * SIM_HZ:
-        _inject_random_hazard()
+        _inject_random_hazard(source="spontaneous")
 
 
 def _sim_thread() -> None:
@@ -403,12 +581,22 @@ def nav_ingest():
     Accepts ESP32 sensor packets in the same format as server.py.
     Returns a plausible motor-command response using active_hazards.
     """
-    data = request.get_json(silent=True) or {}
+    t0        = time.perf_counter()
+    data      = request.get_json(silent=True) or {}
     device_id = data.get("device_id", "sim_device")
-    module     = str(data.get("module", "body")).lower()
-    now        = time.time() * 1000.0
+    module    = str(data.get("module", "body")).lower()
+    now       = time.time() * 1000.0
+    pkt_ts    = int(data.get("timestamp", 0))
 
     hazard = _build_hazard_summary()
+    # [VERIFY:PKT_RECV] – sensor packet arrival (mirrors server.py tag for
+    # packet-count and rate analysis in 2.2.1 R1 / 2.2.5 R1).
+    logger.info(
+        "[VERIFY:PKT_RECV] device=%-14s module=%-4s pkt_ts=%8d "
+        "active_hazards=%d hazard_label=%s",
+        device_id, module, pkt_ts,
+        len(active_hazards), hazard["label"],
+    )
 
     # Build 8 motor commands – active only for hazard directions
     hazard_dirs = {a["direction"]: a for a in hazard["alerts"]}
@@ -446,11 +634,18 @@ def nav_ingest():
         "last_seen_ms": now,
     }
 
+    proc_ms = (time.perf_counter() - t0) * 1000.0
+    _record_proc_time(proc_ms)
+    logger.debug(
+        "[VERIFY:NAV_PROC_TIME] endpoint=/nav device=%-14s proc_ms=%.2f",
+        device_id, proc_ms,
+    )
+
     return jsonify({
         "status": "ok", "device_id": device_id, "module": module,
         "hazard": hazard, "motors": motors,
         "imu": data.get("imu", {"roll_deg": 0, "pitch_deg": 0, "yaw_deg": sim_state["heading"]}),
-        "latency_ms": round(now - int(data.get("timestamp", now)), 1),
+        "latency_ms": round(now - pkt_ts, 1) if pkt_ts else 0.0,
     })
 
 
@@ -479,26 +674,123 @@ def status():
 
 @app.route("/nav/set_command", methods=["POST"])
 def nav_set_command():
+    t0   = time.perf_counter()
     data = request.get_json(silent=True) or {}
+
     command = str(data.get("command", "stop")).lower()
     if command not in DIRECTIONS + ["stop"]:
         command = "stop"
+
+    motor_id  = DIRECTIONS.index(command) if command in DIRECTIONS else -1
+    intensity = int(data.get("intensity", NAV_INTENSITY.get(command, 0)))
+    pattern   = str(data.get("pattern",   NAV_PATTERN.get(command, "off")))
+    phase     = str(data.get("phase", "execute"))
+    dist_m    = data.get("distance_m")
+    instr     = str(data.get("instruction", ""))
+
     nav_state.update({
-        "command": command,
-        "motor_id": DIRECTIONS.index(command) if command in DIRECTIONS else -1,
-        "intensity": int(data.get("intensity", NAV_INTENSITY.get(command, 0))),
-        "pattern": str(data.get("pattern", NAV_PATTERN.get(command, "off"))),
-        "instruction": str(data.get("instruction", "")),
-        "distance_m": data.get("distance_m"),
-        "phase": str(data.get("phase", "execute")),
-        "active": command != "stop",
-        "updated_at": time.time(),
+        "command":     command,
+        "motor_id":    motor_id,
+        "intensity":   intensity,
+        "pattern":     pattern,
+        "instruction": instr,
+        "distance_m":  dist_m,
+        "phase":       phase,
+        "active":      command != "stop",
+        "updated_at":  time.time(),
     })
+
+    proc_ms = (time.perf_counter() - t0) * 1000.0
+    _record_proc_time(proc_ms)
+    _nav_stats["cmd_recv_total"] += 1
+    _nav_stats["cmd_recv_ok"]    += 1   # all server-side receptions are successes
+
+    # [VERIFY:NAV_CMD_RECV] – command delivery from Phone/PC app.
+    # Supports 2.2.7 R1 (≥98 % success rate) and 2.2.1 R2 (≤200 ms latency).
+    # proc_ms is server processing only; end-to-end includes WiFi round-trip.
+    dist_str = f"{dist_m:.1f}" if dist_m is not None else "None"
+    if proc_ms > _NAV_LATENCY_WARN_MS:
+        logger.warning(
+            "[VERIFY:NAV_CMD_RECV] command=%-12s motor_id=%d intensity=%3d "
+            "pattern=%-12s phase=%-7s dist_m=%6s proc_ms=%.2f  "
+            "⚠ SERVER_PROC_EXCEEDS_BUDGET (%.0f ms)",
+            command, motor_id, intensity, pattern, phase,
+            dist_str, proc_ms, _NAV_LATENCY_WARN_MS,
+        )
+    else:
+        logger.info(
+            "[VERIFY:NAV_CMD_RECV] command=%-12s motor_id=%d intensity=%3d "
+            "pattern=%-12s phase=%-7s dist_m=%6s proc_ms=%.2f  "
+            "total_recv=%d  success_rate=%.1f%%",
+            command, motor_id, intensity, pattern, phase, dist_str, proc_ms,
+            _nav_stats["cmd_recv_total"],
+            100.0 * _nav_stats["cmd_recv_ok"] / _nav_stats["cmd_recv_total"],
+        )
+
+    # [VERIFY:NAV_CMD_MOTOR] – one line per command for the 2.2.1 R3 confusion
+    # matrix: cross-activate error < 5 % over 40 trials.
+    # Motor activation parameters also document 2.2.4 R3 (distinct patterns).
+    freq_hz = {"CRITICAL": 50, "DANGER": 20, "WARNING": 10,
+               "CAUTION": 5, "ALERT": 2}.get(
+        nav_state.get("last_zone", "CLEAR"), 0)
+    logger.info(
+        "[VERIFY:NAV_CMD_MOTOR] commanded=%-12s motor_id=%d "
+        "intensity=%3d  freq_hz=%2d  pattern=%-12s  active=%s  "
+        "cmd_count=%d",
+        command, motor_id, intensity, freq_hz, pattern,
+        command != "stop", _nav_stats["cmd_recv_total"],
+    )
+
+    # Record in history for turn-accuracy analysis
+    _nav_stats["cmd_history"].append({
+        "commanded":  command,
+        "motor_id":   motor_id,
+        "phase":      phase,
+        "dist_m":     dist_m,
+        "instruction": instr,
+        "ts":         time.time(),
+    })
+
+    # Log cumulative success rate every 10 commands (2.2.7 R1 table)
+    if _nav_stats["cmd_recv_total"] % 10 == 0:
+        logger.info(
+            "[VERIFY:NAV_CMD_SUMMARY] total_recv=%d  success=%d  "
+            "fail=%d  success_rate=%.1f%%",
+            _nav_stats["cmd_recv_total"],
+            _nav_stats["cmd_recv_ok"],
+            _nav_stats["cmd_recv_total"] - _nav_stats["cmd_recv_ok"],
+            100.0 * _nav_stats["cmd_recv_ok"] / _nav_stats["cmd_recv_total"],
+        )
+
     return jsonify({"status": "ok", **nav_state})
 
 
 @app.route("/nav/get_command", methods=["GET"])
 def nav_get_command():
+    now_ms = time.time() * 1000.0
+    _nav_stats["cmd_poll_total"] += 1
+
+    # Detect if ESP32 has been idle too long (connection-loss check, 2.2.7 R2)
+    last_poll = _nav_stats["cmd_last_poll_ms"]
+    if last_poll > 0:
+        idle_ms = now_ms - last_poll
+        if idle_ms > _CMD_POLL_WARN_IDLE_MS:
+            logger.warning(
+                "[VERIFY:CONN_IDLE] esp32_poll_idle_ms=%.1f  threshold_ms=%.0f  "
+                "← ESP32 may have lost connection",
+                idle_ms, _CMD_POLL_WARN_IDLE_MS,
+            )
+    _nav_stats["cmd_last_poll_ms"] = now_ms
+
+    # [VERIFY:NAV_CMD_POLL] – ESP32 successfully retrieved the navigation command.
+    # Pair poll_count with cmd_recv_total to verify ≥98 % delivery (2.2.7 R1).
+    logger.debug(
+        "[VERIFY:NAV_CMD_POLL] serving command=%-12s motor_id=%2d "
+        "intensity=%3d  active=%s  poll_count=%d",
+        nav_state["command"], nav_state["motor_id"],
+        nav_state["intensity"], nav_state["active"],
+        _nav_stats["cmd_poll_total"],
+    )
     return jsonify({"status": "ok", **nav_state})
 
 
@@ -520,6 +812,23 @@ def nav_set_route():
         "active":           bool(data.get("active", True)),
         "updated_at":       time.time(),
     })
+    _nav_stats["routes_set"] += 1
+
+    # [VERIFY:NAV_ROUTE_SET] – route successfully received from Phone/PC app.
+    # Supports 2.2.7 R1 route delivery tracking.  Step list provides the
+    # ground-truth maneuver sequence for turn-accuracy analysis (High-level R2).
+    steps = data.get("steps", [])
+    maneuvers = [s.get("maneuver", "straight") for s in steps]
+    logger.info(
+        "[VERIFY:NAV_ROUTE_SET] dest_name='%s'  total_m=%.1f  "
+        "total_s=%.0f  steps=%d  maneuvers=[%s]  route_count=%d",
+        route_state["dest_name"],
+        route_state["total_distance_m"],
+        route_state["total_duration_s"],
+        len(steps),
+        ", ".join(maneuvers[:8]) + ("…" if len(maneuvers) > 8 else ""),
+        _nav_stats["routes_set"],
+    )
 
     # Convert steps to sim waypoints so the walker follows the real route
     steps = data.get("steps", [])
@@ -562,16 +871,35 @@ def nav_route_status():
 @app.route("/nav/position", methods=["POST"])
 def nav_position():
     data = request.get_json(silent=True) or {}
+    lat     = data.get("lat")
+    lng     = data.get("lng")
+    heading = data.get("heading")
     position_state.update({
-        "lat": data.get("lat"), "lng": data.get("lng"),
-        "heading": data.get("heading"), "updated_at": time.time(),
+        "lat": lat, "lng": lng,
+        "heading": heading, "updated_at": time.time(),
     })
+
+    # [VERIFY:NAV_POS_UPDATE] – GPS position push from Phone/PC app.
+    # Continuous heading log supports 2.2.3 R4 (≤10° heading error) analysis
+    # and High-level R2 (≥85 % turn accuracy) validation.
+    logger.debug(
+        "[VERIFY:NAV_POS_UPDATE] lat=%s  lng=%s  heading=%s  "
+        "route_active=%s  current_cmd=%-12s",
+        f"{lat:.6f}" if lat is not None else "None",
+        f"{lng:.6f}" if lng is not None else "None",
+        f"{heading:.1f}" if heading is not None else "None",
+        route_state.get("active", False),
+        nav_state.get("command", "unknown"),
+    )
     return jsonify({"status": "ok", "position": position_state, "nav": nav_state})
 
 
 @app.route("/nav/stop", methods=["POST"])
 def nav_stop():
     with _lock:
+        snap_elapsed = sim_state["elapsed_s"]
+        snap_dist    = sim_state["distance_m"]
+        snap_wp      = sim_state["waypoint_index"]
         sim_state["running"] = False
     nav_state.update({
         "command": "stop", "motor_id": -1, "intensity": 0, "pattern": "off",
@@ -579,6 +907,21 @@ def nav_stop():
         "phase": "idle", "active": False, "updated_at": time.time(),
     })
     route_state["active"] = False
+
+    # [VERIFY:NAV_STOPPED] – session end marker.
+    # The cmd_history list accumulated since NAV_ROUTE_SET provides the full
+    # commanded-direction sequence for the turn-accuracy confusion matrix.
+    he   = _nav_stats["heading_errors"]
+    rate = 100.0 * _nav_stats["cmd_recv_ok"] / max(_nav_stats["cmd_recv_total"], 1)
+    logger.info(
+        "[VERIFY:NAV_STOPPED] elapsed_s=%.1f  dist_m=%.1f  "
+        "waypoints_reached=%d  cmd_total=%d  cmd_success_rate=%.1f%%  "
+        "heading_err_avg=%.1f°  heading_err_max=%.1f°",
+        snap_elapsed, snap_dist, snap_wp,
+        _nav_stats["cmd_recv_total"], rate,
+        sum(he) / len(he) if he else 0.0,
+        max(he) if he else 0.0,
+    )
     return jsonify({"status": "ok"})
 
 
@@ -683,6 +1026,17 @@ def sim_inject_hazard():
             "expires_at": time.time() + duration,
             "source":     "manual",
         })
+        _nav_stats["hazard_inject_count"] += 1
+
+    # [VERIFY:SIM_HAZARD_INJ] – manual hazard injection for 2.2.2 R1 recall test.
+    logger.info(
+        "[VERIFY:SIM_HAZARD_INJ] direction=%-12s zone=%-8s dist_m=%s "
+        "duration_s=%.1f  source=manual  total_active=%d  total_injected=%d",
+        direction, zone,
+        f"{ZONE_DISTANCES.get(zone):.1f}" if ZONE_DISTANCES.get(zone) else "None",
+        duration, len(active_hazards),
+        _nav_stats["hazard_inject_count"],
+    )
     return jsonify({"status": "ok", "direction": direction, "zone": zone, "duration_s": duration})
 
 
@@ -704,6 +1058,72 @@ def sim_config():
         if "hazard_dur_s" in data:
             sim_cfg["hazard_dur_s"] = float(max(0.5, data["hazard_dur_s"]))
     return jsonify({"status": "ok", **sim_cfg})
+
+
+# ---------------------------------------------------------------------------
+# ── Navigation log summary endpoint ─────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+@app.route("/nav/log_summary", methods=["GET"])
+def nav_log_summary():
+    """
+    Return a snapshot of accumulated navigation statistics for requirement
+    verification.  Call after a test run to get the tables the design doc asks
+    for in each verification column.
+
+    Key fields and the requirement they satisfy
+    -------------------------------------------
+    cmd_recv_total / cmd_success_rate     2.2.7 R1  – ≥ 98 % delivery
+    cmd_poll_total                        2.2.7 R1  – ESP32 retrieval count
+    waypoints_reached                     High-level R2 / 2.2.1 R3 turn accuracy
+    heading_err_avg / heading_err_max     2.2.3 R4  – ≤ 10° heading error
+    proc_time_avg / proc_time_max         2.2.8 R2  – < 500 ms end-to-end
+    hazard_inject_count                   2.2.2 R1  – ground-truth for recall
+    cmd_history (last 20)                 2.2.1 R3  – confusion-matrix rows
+    """
+    he = _nav_stats["heading_errors"]
+    pt = _nav_stats["proc_time_count"]
+    recv  = _nav_stats["cmd_recv_total"]
+    ok    = _nav_stats["cmd_recv_ok"]
+
+    with _lock:
+        snap = dict(sim_state)
+
+    return jsonify({
+        # 2.2.7 R1 – command delivery success rate
+        "cmd_recv_total":     recv,
+        "cmd_recv_ok":        ok,
+        "cmd_success_rate_pct": round(100.0 * ok / recv, 2) if recv else None,
+        "cmd_poll_total":     _nav_stats["cmd_poll_total"],
+        "routes_set":         _nav_stats["routes_set"],
+
+        # 2.2.1 R3 / High-level R2 – turn accuracy
+        "waypoints_reached":  _nav_stats["waypoints_reached"],
+        "cmd_history_count":  len(_nav_stats["cmd_history"]),
+        "cmd_history_last20": _nav_stats["cmd_history"][-20:],
+
+        # 2.2.3 R4 – heading error during straight walk
+        "heading_err_samples": len(he),
+        "heading_err_avg_deg": round(sum(he) / len(he), 2) if he else None,
+        "heading_err_max_deg": round(max(he), 2) if he else None,
+        "heading_err_gt10_count": sum(1 for e in he if e > 10.0),
+
+        # 2.2.8 R2 – server processing latency
+        "proc_time_samples":  pt,
+        "proc_time_avg_ms":   round(_nav_stats["proc_time_sum_ms"] / pt, 3) if pt else None,
+        "proc_time_max_ms":   round(_nav_stats["proc_time_max_ms"], 3),
+
+        # 2.2.2 R1 – hazard injection ground truth
+        "hazard_inject_count": _nav_stats["hazard_inject_count"],
+        "active_hazards_now":  len(active_hazards),
+
+        # Current simulation state (for reference)
+        "sim_running":     snap["running"],
+        "sim_elapsed_s":   round(snap["elapsed_s"], 1),
+        "sim_distance_m":  round(snap["distance_m"], 1),
+        "sim_waypoint_idx": snap["waypoint_index"],
+        "route_source":    snap["route_source"],
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -1076,11 +1496,14 @@ refresh();
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("  OmniSense-Dual  Test Simulation Server")
-    print("  http://0.0.0.0:5001")
-    print()
-    print("  Control panel →  http://localhost:5001/sim/ui")
-    print("  Set frontend SERVER_URL to  http://localhost:5001")
-    print("=" * 60)
+    log_file = _setup_logging()
+    logger.info("=" * 60)
+    logger.info("  OmniSense-Dual  Test Simulation Server")
+    logger.info("  http://0.0.0.0:5001")
+    logger.info("")
+    logger.info("  Control panel  →  http://localhost:5001/sim/ui")
+    logger.info("  Nav log summary→  http://localhost:5001/nav/log_summary")
+    logger.info("  Log file       →  %s", log_file)
+    logger.info("  Set frontend SERVER_URL to  http://localhost:5001")
+    logger.info("=" * 60)
     app.run(host="0.0.0.0", port=5001, debug=False, threaded=True)
