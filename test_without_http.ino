@@ -219,7 +219,7 @@ static TofSensor tofs[8] = {
   { "back",            2,   21,   false,   -1,    0,  32767,    0,   0,   0 },  // B   GPIO21  (schematic: XSHUT_B)
   { "back_left",       6,   24,   false,   -1,    0,  32767,    0,   0,   0 },  // BL  GPIO24  (schematic: XSHUT_BL)
   { "left",            3,   22,   false,   -1,    0,  32767,    0,   0,   0 },  // L   GPIO22  (schematic: XSHUT_L)
-  { "front_left",      4,   26,   false,   -1,    0,  32767,    0,   0,   0 },  // FL  GPIO26  (schematic: XSHUT_FL)
+  { "front_left",      4,    3,   false,   -1,    0,  32767,    0,   0,   0 },  // FL  GPIO3   (schematic: XSHUT_FL)
 };
 
 // ── MUX helper ───────────────────────────────────────────────────────────────
@@ -703,7 +703,7 @@ void setup() {
   // ── TEST 8: TCA9548A + VL53L1X ToF Sensors ───────────────────────────────
   Serial.println("[TEST 8] TCA9548A MUX (0x77) + 8× VL53L1X ToF");
   Serial.println("  F/FR/R/BR → MUX ch 0/5/1/7  XSHUT GPIO 19/46/38/25");
-  Serial.println("  B/BL/L/FL → MUX ch 2/6/3/4  XSHUT GPIO 21/24/22/26");
+  Serial.println("  B/BL/L/FL → MUX ch 2/6/3/4  XSHUT GPIO 21/24/22/3");
   initToFSensors();
   Serial.println();
 
@@ -711,8 +711,29 @@ void setup() {
   Serial.println("[TEST 9] DRV2605L Haptic Motors (MUX 0x70)");
   Serial.println("  n/ne/e/se → MUX ch 0/1/2/3   (front/front_right/right/back_right)");
   Serial.println("  s/sw/w/nw → MUX ch 4/5/6/7   (back/back_left/left/front_left)");
-  Serial.println("  Thresholds: CRITICAL≤300mm(RTP127) WARNING≤600mm(70) CAUTION≤1000mm(30)");
+  Serial.println("  NOTE: Motors initialised but RTP kept at 0 (silent) — haptic update disabled.");
   initDrvMotors();
+
+  // Per-motor sequential buzz test — each motor individually at RTP=64 for 500ms
+  Serial.println("  Motor connection test: buzzing each motor individually at RTP=64 for 500ms...");
+  for (uint8_t i = 0; i < 8; i++) {
+    Serial.print("    Testing "); Serial.print(drvs[i].dir);
+    Serial.print(" (MUX ch "); Serial.print(drvs[i].mux_ch); Serial.print("): ");
+    if (!drvs[i].present) {
+      Serial.println("SKIP (not detected)");
+      continue;
+    }
+    muxSelectDrv(drvs[i].mux_ch);
+    delayMicroseconds(500);
+    drvDev[i].setRealtimeValue(64);
+    Serial.println("BUZZING...");
+    delay(5000);
+    drvDev[i].setRealtimeValue(0);
+    drvs[i].rtp = 0;
+    muxSelectDrv(0xFF);
+    delay(100);   // brief gap between motors so you can feel the difference
+  }
+  Serial.println("  Motor test complete — all motors silenced.");
   Serial.println();
 
   // ── TEST 10: C4001 24 GHz mmWave Radar Sensors ────────────────────────────
@@ -739,8 +760,8 @@ void loop() {
   // ── Poll mmWave radar OUT pins + drain UART buffers ───────────────────────
   pollRadars();
 
-  // ── Update haptic motors from latest ToF readings ──────────────────────
-  updateHaptics();
+  // ── Update haptic motors from latest ToF readings ── DISABLED ────────
+  // updateHaptics();
 
   // ── Serial live print every 3 s (purely for monitoring, does not gate POST) ─
   static unsigned long lastPrint = 0;
