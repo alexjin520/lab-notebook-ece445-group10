@@ -80,14 +80,17 @@ All log lines tagged [VERIFY:TAG] map directly to design-document requirements:
 
 from __future__ import annotations
 
+import json
 import logging
 import logging.handlers
 import os
 import time
 from collections import defaultdict
+import datetime
 from typing import Any
 
-from flask import Flask, request, jsonify
+import os
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
 from algorithm import process_combined_packet, print_decision, fresh_device_state
@@ -124,6 +127,7 @@ def _setup_logging(log_dir: str = _LOG_DIR) -> None:
 
     ts    = time.strftime("%Y%m%d_%H%M%S")
     fpath = os.path.join(log_dir, f"omnisense_{ts}.log")
+    json_fpath = os.path.join(log_dir, f"omnisense_{ts}_raw.jsonl")
 
     root = logging.getLogger("omnisense")
     root.setLevel(logging.DEBUG)
@@ -151,10 +155,24 @@ def _setup_logging(log_dir: str = _LOG_DIR) -> None:
     ))
     root.addHandler(fh)
 
+    # ── Raw JSON packet log (one JSON object per line) ────────────────────────
+    # Every packet received by /nav is written here verbatim so you can
+    # diff exactly what the firmware sent against what the server parsed.
+    jh = logging.handlers.RotatingFileHandler(
+        json_fpath, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8",
+    )
+    jh.setLevel(logging.DEBUG)
+    jh.setFormatter(logging.Formatter("%(message)s"))   # raw message only
+    json_logger = logging.getLogger("omnisense.raw_json")
+    json_logger.propagate = False   # don't echo to console / main log
+    json_logger.setLevel(logging.DEBUG)
+    json_logger.handlers.clear()
+    json_logger.addHandler(jh)
+
     logging.getLogger("omnisense.server").info(
-        "[VERIFY:SESSION_START] log_file=%s latency_warn_ms=%.0f "
+        "[VERIFY:SESSION_START] log_file=%s json_log=%s latency_warn_ms=%.0f "
         "timeout_threshold_ms=%.0f rate_min_hz=%.1f",
-        fpath, _LATENCY_WARN_MS, _TIMEOUT_THRESHOLD_MS, _RATE_MIN_HZ,
+        fpath, json_fpath, _LATENCY_WARN_MS, _TIMEOUT_THRESHOLD_MS, _RATE_MIN_HZ,
     )
 
 
@@ -175,6 +193,9 @@ latest_module_data: dict = {"head": {}, "body": {}}
 
 # Persistent state for the combined dual-module fusion result
 combined_state: dict = fresh_device_state()
+
+# Latest fully-processed sensor snapshot exposed via GET /sensor_state
+_latest_sensor_state: dict[str, Any] = {}
 
 # ---------------------------------------------------------------------------
 # Per-device runtime statistics  (separate from device_state so tests that
@@ -265,26 +286,64 @@ def nav() -> tuple:
         )
         return jsonify({"status": "error", "message": "invalid or missing JSON"}), 400
 
+    # ── Raw JSON dump (goes only to omnisense_{ts}_raw.jsonl) ─────────────────
+    logging.getLogger("omnisense.raw_json").debug(
+        '{"server_ts": "%s", "body": %s}',
+        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        json.dumps(data, separators=(",", ":")),
+    )
+
     now_ms    = time.time() * 1000.0
     t_start   = time.perf_counter()
 
     device_id = str(data.get("device_id", "esp32"))
     pkt_ts    = int(data.get("timestamp", 0))
+    uptime_ms = data.get("uptime_ms")          # top-level uptime since ESP32 boot
     module    = str(data.get("module", "body")).lower()
     if module not in ("head", "body"):
         module = "body"
 
     _ensure_stats(device_id)
 
+    # ── Optional power / system telemetry ────────────────────────────────────
+    battery = data.get("battery") or {}
+    system  = data.get("system")  or {}
+
     # ── 1. Packet-receive log  [VERIFY:PKT_RECV] ─────────────────────────────
     # Supports 2.2.1 R1 (sampling frequency / packet loss) and
     # 2.2.5 R1 (≥10 Hz packet rate) verification.
+    _UNIX_EPOCH_MIN_MS = 1_577_836_800_000   # Jan 1 2020 — distinguishes epoch vs uptime
     pkt_count = device_state[device_id]["packet_count"] + 1  # pre-increment preview
+    if pkt_ts > _UNIX_EPOCH_MIN_MS:
+        ts_label = datetime.datetime.utcfromtimestamp(pkt_ts / 1000.0).strftime("%H:%M:%S.%f")[:-3] + " UTC"
+    else:
+        ts_label = f"{pkt_ts} ms (uptime)"
     logger.info(
-        "[VERIFY:PKT_RECV] device=%-14s module=%-4s pkt_ts=%8d "
+        "┌─ PKT #%-4d  device=%-14s  module=%-4s  ts=%s",
+        pkt_count, device_id, module, ts_label,
+    )
+    logger.info(
+        "│  [VERIFY:PKT_RECV]   device=%-14s module=%-4s pkt_ts=%d "
         "server_ms=%.1f count=%d",
         device_id, module, pkt_ts, now_ms, pkt_count,
     )
+
+    # ── 1b. Power / system telemetry  [VERIFY:POWER] ─────────────────────────
+    # Logs ESP32 battery and system health fields when provided in the packet.
+    if battery or system or uptime_ms is not None:
+        uptime_s_str = f"{uptime_ms / 1000.0:.1f}" if uptime_ms is not None else "—"
+        logger.info(
+            "│  [VERIFY:POWER]      device=%-14s  "
+            "voltage_v=%-6s  soc_pct=%-5s  temp_c=%-5s  "
+            "heap_b=%-7s  rssi=%-4s  uptime_s=%s",
+            device_id,
+            battery.get("voltage_v", "—"),
+            battery.get("soc_pct",   "—"),
+            system.get("die_temp_c",  "—"),
+            system.get("free_heap_b", "—"),
+            system.get("wifi_rssi",   "—"),
+            uptime_s_str,
+        )
 
     # ── 2. Inter-packet rate log  [VERIFY:PKT_RATE] ──────────────────────────
     # Supports 2.2.5 R1 (sensor packets ≥10 Hz) and
@@ -301,14 +360,14 @@ def nav() -> tuple:
 
         if rate_hz < _RATE_MIN_HZ:
             logger.warning(
-                "[VERIFY:PKT_RATE] device=%-14s module=%-4s "
+                "│  [VERIFY:PKT_RATE]   device=%-14s module=%-4s "
                 "interval_ms=%.1f  rate_hz=%.2f  avg_rate_hz=%.2f  "
                 "⚠ BELOW_MINIMUM (%.1f Hz)",
                 device_id, module, interval_ms, rate_hz, avg_rate_hz, _RATE_MIN_HZ,
             )
         else:
             logger.info(
-                "[VERIFY:PKT_RATE] device=%-14s module=%-4s "
+                "│  [VERIFY:PKT_RATE]   device=%-14s module=%-4s "
                 "interval_ms=%.1f  rate_hz=%.2f  avg_rate_hz=%.2f",
                 device_id, module, interval_ms, rate_hz, avg_rate_hz,
             )
@@ -323,7 +382,7 @@ def nav() -> tuple:
         other_idle_ms = now_ms - other_ts if other_ts else float("inf")
         if other_idle_ms > _MODULE_STALE_MS:
             logger.warning(
-                "[VERIFY:MODULE_STALE] other_module=%-4s idle_ms=%.1f  "
+                "│  [VERIFY:MODULE_STALE] other_module=%-4s idle_ms=%.1f  "
                 "threshold_ms=%.0f  ← fusion using stale %s data",
                 other_module, other_idle_ms, _MODULE_STALE_MS, other_module,
             )
@@ -350,29 +409,47 @@ def nav() -> tuple:
 
     if proc_ms > _PROC_TIME_WARN_MS:
         logger.warning(
-            "[VERIFY:PROC_TIME] device=%-14s proc_ms=%.2f  "
+            "│  [VERIFY:PROC_TIME]  device=%-14s proc_ms=%.2f  "
             "⚠ EXCEEDS_BUDGET (%.0f ms)",
             device_id, proc_ms, _PROC_TIME_WARN_MS,
         )
     else:
         logger.debug(
-            "[VERIFY:PROC_TIME] device=%-14s proc_ms=%.2f",
+            "│  [VERIFY:PROC_TIME]  device=%-14s proc_ms=%.2f",
             device_id, proc_ms,
         )
 
     # ── 6. End-to-end latency warning  [VERIFY:LATENCY_WARN] ─────────────────
-    # The algorithm already computes latency_ms = server_now - pkt_timestamp.
-    # NOTE: this is only meaningful when the ESP32 uses NTP-synchronised Unix
-    # timestamps.  Log it for reference; oscilloscope verification is still
-    # required for the hardware-to-motor timing path (2.2.1 R2, 2.2.2 R2).
+    # ── 6. End-to-end latency check  [VERIFY:LATENCY_WARN] ──────────────────
+    # pkt_ts is the ESP32 uptime (ms since boot), NOT a Unix epoch timestamp,
+    # unless the firmware uses NTP.  We detect this by checking whether pkt_ts
+    # looks like a Unix epoch value (> Jan 1 2020 = 1_577_836_800_000 ms).
+    # If it is clearly an uptime value we skip the bogus subtraction and log a
+    # one-time advisory instead of a wall of false warnings.
     latency_ms = result.get("latency_ms", 0.0)
-    if latency_ms > _LATENCY_WARN_MS:
-        logger.warning(
-            "[VERIFY:LATENCY_WARN] device=%-14s latency_ms=%.1f  "
-            "⚠ EXCEEDS_BUDGET (%.0f ms)  "
-            "note=requires_NTP_sync_for_accuracy",
-            device_id, latency_ms, _LATENCY_WARN_MS,
-        )
+    if pkt_ts > _UNIX_EPOCH_MIN_MS:
+        # Firmware is sending real Unix timestamps — check the latency budget.
+        if latency_ms > _LATENCY_WARN_MS:
+            logger.warning(
+                "│  [VERIFY:LATENCY_WARN] device=%-14s latency_ms=%.1f  "
+                "⚠ EXCEEDS_BUDGET (%.0f ms)",
+                device_id, latency_ms, _LATENCY_WARN_MS,
+            )
+        else:
+            logger.debug(
+                "│  [VERIFY:LATENCY_WARN] device=%-14s latency_ms=%.1f  OK",
+                device_id, latency_ms,
+            )
+    else:
+        # pkt_ts is ESP32 uptime — latency cannot be computed server-side.
+        # Log once per device when it first appears, then go silent.
+        if device_state[device_id].get("packet_count", 0) <= 1:
+            logger.info(
+                "│  [VERIFY:LATENCY_INFO] device=%-14s pkt_ts=%d ms (uptime)  "
+                "latency_ms N/A — ESP32 not NTP-synced; "
+                "use oscilloscope for hardware timing verification",
+                device_id, pkt_ts,
+            )
 
     # ── 7. Connection-timeout detection  [VERIFY:TIMEOUT_DETECT] ─────────────
     # Supports 2.2.5 R3 (≤2 s loss detection) and 2.2.7 R2 (≤2 s status update).
@@ -383,7 +460,7 @@ def nav() -> tuple:
         idle_ms = now_ms - t["last_recv_ms"]
         if idle_ms > _TIMEOUT_THRESHOLD_MS:
             logger.warning(
-                "[VERIFY:TIMEOUT_DETECT] device=%-14s idle_ms=%.1f  "
+                "│  [VERIFY:TIMEOUT_DETECT] device=%-14s idle_ms=%.1f  "
                 "threshold_ms=%.0f  ← connection assumed lost",
                 dev_id, idle_ms, _TIMEOUT_THRESHOLD_MS,
             )
@@ -395,7 +472,7 @@ def nav() -> tuple:
     new_zone  = result["hazard"]["label"]
     if new_zone != prev_zone:
         logger.info(
-            "[VERIFY:HAZARD_ZONE_CHG] device=%-14s %s → %s  "
+            "│  [VERIFY:HAZARD_ZONE_CHG] device=%-14s %s → %s  "
             "alert_count=%d",
             device_id, prev_zone, new_zone,
             len(result["hazard"]["alerts"]),
@@ -409,6 +486,62 @@ def nav() -> tuple:
     dev["packet_count"] += 1
     dev["last_zone"]     = new_zone
 
+    # ── 10. Update live sensor state snapshot for /sensor_state ─────────────
+    head_pkt = latest_module_data.get("head", {})
+    body_pkt = latest_module_data.get("body", {})
+
+    def _tof_to_m(tof_dict: dict) -> dict:
+        """Convert raw tof_sensors dict → {direction: dist_m | None}."""
+        out = {}
+        for d, v in tof_dict.items():
+            if not isinstance(v, dict):
+                out[d] = None; continue
+            raw = v.get("avg") or v.get("distance_mm")
+            out[d] = None if (raw is None or raw >= 8190 or raw <= 0) else round(raw / 1000.0, 4)
+        return out
+
+    t = _device_timing.get(device_id, {})
+    avg_interval = (t.get("interval_sum_ms", 0) / t["interval_count"]
+                    if t.get("interval_count") else None)
+    rate_hz = round(1000.0 / avg_interval, 2) if avg_interval else None
+
+    batt   = body_pkt.get("battery") or {}
+    sys_   = body_pkt.get("system")  or {}
+    _latest_sensor_state.update({
+        "device_id":   device_id,
+        "module":      module,
+        "pkt_count":   device_state[device_id]["packet_count"] + 1,
+        "timestamp":   now_ms,
+        "tof_body":    _tof_to_m(body_pkt.get("tof_sensors", {})),
+        "tof_head":    _tof_to_m(head_pkt.get("tof_sensors", {})),
+        "mmwave_body": body_pkt.get("mmwave_sensors", {}),
+        "mmwave_head": head_pkt.get("mmwave_sensors", {}),
+        "imu_body":    body_pkt.get("imu", {}),
+        "imu_head":    head_pkt.get("imu", {}),
+        "fused": {
+            m["direction"]: {
+                "dist_m":  m["distance_m"],
+                "zone":    m["zone"],
+                "source":  m["source"],
+            }
+            for m in result["motors"]
+        },
+        "motors":      result["motors"],
+        "hazard":      result["hazard"],
+        "imu_combined": result["imu"],
+        "power": {
+            "voltage_v": batt.get("voltage_v"),
+            "soc_pct":   batt.get("soc_pct"),
+            "temp_c":    sys_.get("die_temp_c"),
+            "heap_b":    sys_.get("free_heap_b"),
+            "rssi":      sys_.get("wifi_rssi"),
+            "uptime_s":  (body_pkt.get("uptime_ms", 0) or 0) / 1000.0,
+        },
+        "pkt_rate_hz": rate_hz,
+        "proc_ms":     round(proc_ms, 2),
+        "latency_ms":  round(latency_ms, 1),
+    })
+
     # Emit the concise decision line (uses algorithm logger)
     print_decision(
         result["hazard"]["alerts"],
@@ -416,8 +549,17 @@ def nav() -> tuple:
         device_id,
         pkt_ts,
     )
+    logger.info(
+        "└─ PKT #%-4d  device=%-14s  hazard=%-8s  proc_ms=%.2f",
+        pkt_count, device_id, new_zone, proc_ms,
+    )
 
-    return jsonify({"status": "ok", "device_id": device_id, **result})
+    return jsonify({
+        "status":          "ok",
+        "device_id":       device_id,
+        "server_recv_ms":  now_ms,   # ← ESP32: compute RTT as millis()-pkt_ts_sent, latency≈RTT/2
+        **result,
+    })
 
 
 @app.route("/status", methods=["GET"])
@@ -432,6 +574,20 @@ def status() -> tuple:
         for dev_id, state in device_state.items()
     }
     return jsonify({"status": "running", "devices": active})
+
+
+@app.route("/sensor_state", methods=["GET"])
+def sensor_state() -> tuple:
+    """
+    Returns the latest fully-processed sensor snapshot for the dashboard.
+
+    Includes raw ToF/mmWave/IMU readings from both modules, the fused
+    per-direction obstacle map, all 8 motor commands, hazard summary,
+    power telemetry, and packet statistics.
+    """
+    if not _latest_sensor_state:
+        return jsonify({"status": "waiting", "message": "No packets received yet"}), 204
+    return jsonify({"status": "ok", **_latest_sensor_state})
 
 
 @app.route("/log_summary", methods=["GET"])
@@ -695,6 +851,21 @@ def nav_stop():
     route_state["updated_at"] = time.time()
     nav_logger.info("[NAV:STOP] navigation stopped by app")
     return jsonify({"status": "ok"})
+
+
+_FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "frontend")
+
+
+@app.route("/dashboard")
+def dashboard():
+    """Serve the sensor dashboard UI directly from the Flask server."""
+    return send_from_directory(_FRONTEND_DIR, "sensor_dashboard.html")
+
+
+@app.route("/frontend/<path:filename>")
+def frontend_static(filename):
+    """Serve any other frontend asset (CSS, JS, etc.) under /frontend/."""
+    return send_from_directory(_FRONTEND_DIR, filename)
 
 
 if __name__ == "__main__":

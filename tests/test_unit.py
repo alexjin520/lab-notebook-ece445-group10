@@ -71,9 +71,19 @@ def _empty_mmwave() -> dict:
 
 
 def _make_mmwave(sensor_id: str, range_m: float) -> dict:
-    base = {"front": None, "back": None}
-    base[sensor_id] = {"targets": 1, "range_m": range_m,
-                       "speed_ms": 0.1, "energy": 5000}
+    """Build a **parsed** mmwave dict (output of _parse_mmwave_sensors) for use
+    in _fuse_sensor_data tests.  Both sensors default to None (no detection)."""
+    base: dict = {"front": None, "back": None}
+    base[sensor_id] = {"range_m": range_m, "speed_ms": 0.0, "energy": 5000}
+    return base
+
+
+def _make_mmwave_raw(sensor_id: str, dist_cm: int, energy: int = 5000) -> dict:
+    """Build a **raw firmware-format** mmwave_sensors dict for packet-level tests."""
+    base = {"front": {"presence": False, "det_state": 0},
+            "back":  {"presence": False, "det_state": 0}}
+    base[sensor_id] = {"presence": True, "det_state": 2,
+                       "dist_cm": dist_cm, "energy": energy, "frames": 4}
     return base
 
 
@@ -168,11 +178,12 @@ class TestParseTofSensors:
         result = _parse_tof_sensors(data)
         assert result["front"] == pytest.approx(2.0)
 
-    def test_prefers_avg_over_distance_mm(self):
+    def test_prefers_distance_mm_over_avg(self):
+        # distance_mm is the most-recent reading; avg may lag behind
         data = {"front": {"distance_mm": 3000, "avg": 2500,
                            "min": 2480, "max": 2520, "count": 50}}
         result = _parse_tof_sensors(data)
-        assert result["front"] == pytest.approx(2.5)
+        assert result["front"] == pytest.approx(3.0)
 
     def test_sentinel_value_returns_none(self):
         data = {"front": {"distance_mm": TOF_INVALID_MM, "avg": TOF_INVALID_MM}}
@@ -218,37 +229,35 @@ class TestParseMmwaveSensors:
 
     def test_no_targets_returns_none(self):
         data = {
-            "front": {"targets": 0, "range_m": 0.0, "speed_ms": 0.0, "energy": 0},
-            "back":  {"targets": 0, "range_m": 0.0, "speed_ms": 0.0, "energy": 0},
+            "front": {"presence": False, "det_state": 0},
+            "back":  {"presence": False, "det_state": 0},
         }
         result = _parse_mmwave_sensors(data)
         assert result["front"] is None
         assert result["back"] is None
 
     def test_valid_target_parsed(self):
-        data = {"front": {"targets": 1, "range_m": 7.5, "speed_ms": 0.11,
-                           "energy": 10576},
-                "back":  {"targets": 0, "range_m": 0.0, "speed_ms": 0.0,
-                           "energy": 0}}
+        data = {"front": {"presence": True, "det_state": 2,
+                           "dist_cm": 750, "energy": 10576, "frames": 4},
+                "back":  {"presence": False, "det_state": 0}}
         result = _parse_mmwave_sensors(data)
         assert result["front"] is not None
         assert result["front"]["range_m"] == pytest.approx(7.5)
-        assert result["front"]["speed_ms"] == pytest.approx(0.11)
         assert result["back"] is None
 
     def test_beyond_max_range_returns_none(self):
-        data = {"front": {"targets": 1, "range_m": MMWAVE_MAX_RANGE_M + 1.0,
-                           "speed_ms": 0.0, "energy": 100},
-                "back":  {"targets": 0, "range_m": 0.0, "speed_ms": 0.0,
-                           "energy": 0}}
+        dist_cm = int((MMWAVE_MAX_RANGE_M + 1.0) * 100)
+        data = {"front": {"presence": True, "det_state": 2,
+                           "dist_cm": dist_cm, "energy": 100, "frames": 1},
+                "back":  {"presence": False, "det_state": 0}}
         result = _parse_mmwave_sensors(data)
         assert result["front"] is None
 
     def test_at_mmwave_max_range_accepted(self):
-        data = {"front": {"targets": 1, "range_m": MMWAVE_MAX_RANGE_M,
-                           "speed_ms": 0.0, "energy": 100},
-                "back":  {"targets": 0, "range_m": 0.0, "speed_ms": 0.0,
-                           "energy": 0}}
+        dist_cm = int(MMWAVE_MAX_RANGE_M * 100)
+        data = {"front": {"presence": True, "det_state": 2,
+                           "dist_cm": dist_cm, "energy": 100, "frames": 1},
+                "back":  {"presence": False, "det_state": 0}}
         result = _parse_mmwave_sensors(data)
         assert result["front"] is not None
         assert result["front"]["range_m"] == pytest.approx(MMWAVE_MAX_RANGE_M)
@@ -260,8 +269,10 @@ class TestParseMmwaveSensors:
 
     def test_both_sensors_active(self):
         data = {
-            "front": {"targets": 2, "range_m": 6.0, "speed_ms": 0.2, "energy": 8000},
-            "back":  {"targets": 1, "range_m": 9.0, "speed_ms": 0.0, "energy": 3000},
+            "front": {"presence": True, "det_state": 2,
+                       "dist_cm": 600, "energy": 8000, "frames": 4},
+            "back":  {"presence": True, "det_state": 2,
+                       "dist_cm": 900, "energy": 3000, "frames": 2},
         }
         result = _parse_mmwave_sensors(data)
         assert result["front"]["range_m"] == pytest.approx(6.0)
@@ -709,9 +720,7 @@ class TestProcessPacket:
 
     def test_mmwave_alert_beyond_tof(self):
         pkt = _make_full_packet()
-        pkt["mmwave_sensors"]["front"] = {
-            "targets": 1, "range_m": 8.0, "speed_ms": 0.1, "energy": 6000
-        }
+        pkt["mmwave_sensors"] = _make_mmwave_raw("front", dist_cm=800, energy=6000)
         result = process_packet(pkt, _flat_state(), 1100.0)
         # The three front-cone directions should be ALERT
         for d in MMWAVE_COVERAGE["front"]:
@@ -723,9 +732,7 @@ class TestProcessPacket:
         pkt["tof_sensors"]["front"] = {
             "distance_mm": 500, "avg": 500, "min": 490, "max": 510, "count": 50
         }
-        pkt["mmwave_sensors"]["front"] = {
-            "targets": 1, "range_m": 8.0, "speed_ms": 0.1, "energy": 6000
-        }
+        pkt["mmwave_sensors"] = _make_mmwave_raw("front", dist_cm=800, energy=6000)
         result = process_packet(pkt, _flat_state(), 1100.0)
         motor_front = next(m for m in result["motors"] if m["direction"] == "front")
         # ToF reads 0.5 m (DANGER); mmWave reads 8 m (ALERT) – min = 0.5 m wins

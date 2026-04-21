@@ -196,7 +196,7 @@ def _parse_tof_sensors(tof_data: dict) -> dict[str, float | None]:
     Expected shape::
 
         "tof_sensors": {
-            "front":       {"distance_mm": 1200, "avg": 1200, "min": 1100, "max": 1300, "count": 50},
+            "front":       {"distance_mm": 1200, "min": 1100, "avg": 1200, "max": 1300, "count": 50},
             "front_right": { ... },
             "right":       { ... },
             "back_right":  { ... },
@@ -215,8 +215,8 @@ def _parse_tof_sensors(tof_data: dict) -> dict[str, float | None]:
         if reading is None:
             result[direction] = None
             continue
-        # Prefer averaged value for stability; fall back to raw reading
-        raw_mm = reading.get("avg") or reading.get("distance_mm")
+        # Use distance_mm (most-recent reading) for accuracy; fall back to avg
+        raw_mm = reading.get("distance_mm") or reading.get("avg")
         if raw_mm is None or raw_mm >= TOF_INVALID_MM or raw_mm <= 0:
             result[direction] = None
         else:
@@ -237,11 +237,17 @@ def _parse_mmwave_sensors(mmwave_data: dict) -> dict[str, dict | None]:
     """
     Parse the ``mmwave_sensors`` sub-object from the ESP32 packet.
 
-    Expected shape::
+    Firmware shape (esp32_power / esp32_head)::
 
         "mmwave_sensors": {
-            "front": {"targets": 1, "range_m": 7.5, "speed_ms": 0.11, "energy": 10576},
-            "back":  {"targets": 0, "range_m": 0.0, "speed_ms": 0.0,  "energy": 0}
+            "front": {
+                "presence":  true,       # bool – target detected
+                "det_state": 2,          # internal radar state int
+                "dist_cm":   312,        # distance in cm (only present when presence=true)
+                "energy":    10576,      # signal energy  (only present when presence=true)
+                "frames":    4           # frame count    (only present when presence=true)
+            },
+            "back": { "presence": false, "det_state": 0 }
         }
 
     Returns a dict mapping sensor id ('front' / 'back') → detection dict
@@ -250,16 +256,20 @@ def _parse_mmwave_sensors(mmwave_data: dict) -> dict[str, dict | None]:
     result: dict[str, dict | None] = {}
     for sensor_id in ("front", "back"):
         reading = mmwave_data.get(sensor_id)
-        if reading is None or reading.get("targets", 0) == 0:
+        if reading is None or not reading.get("presence", False):
             result[sensor_id] = None
             continue
-        range_m = float(reading.get("range_m", 0.0))
+        dist_cm = reading.get("dist_cm")
+        if dist_cm is None:
+            result[sensor_id] = None
+            continue
+        range_m = float(dist_cm) / 100.0
         if range_m <= 0.0 or range_m > MMWAVE_MAX_RANGE_M:
             result[sensor_id] = None
         else:
             result[sensor_id] = {
                 "range_m":  range_m,
-                "speed_ms": float(reading.get("speed_ms", 0.0)),
+                "speed_ms": 0.0,                          # firmware does not send speed
                 "energy":   int(reading.get("energy", 0)),
             }
 
@@ -267,8 +277,8 @@ def _parse_mmwave_sensors(mmwave_data: dict) -> dict[str, dict | None]:
         v = result[sid]
         if v is not None:
             logger.debug(
-                "[VERIFY:MMWAVE_RAW] sensor=%-5s target=yes range_m=%.3f speed_ms=%.3f energy=%d",
-                sid, v["range_m"], v["speed_ms"], v["energy"],
+                "[VERIFY:MMWAVE_RAW] sensor=%-5s target=yes range_m=%.3f energy=%d",
+                sid, v["range_m"], v["energy"],
             )
         else:
             logger.debug("[VERIFY:MMWAVE_RAW] sensor=%-5s target=no", sid)
@@ -636,10 +646,8 @@ def process_packet(data: dict[str, Any], state: dict, now_ms: float) -> dict:
               "front_left":  { ... }
           },
           "mmwave_sensors": {
-              "front": {"targets": 1, "range_m": 7.5,
-                        "speed_ms": 0.11, "energy": 10576},
-              "back":  {"targets": 0, "range_m": 0.0,
-                        "speed_ms": 0.0,  "energy": 0}
+              "front": {"presence": true,  "det_state": 2, "dist_cm": 312, "energy": 10576, "frames": 4},
+              "back":  {"presence": false, "det_state": 0}
           },
           "imu": {
               "roll_deg": 2.5, "pitch_deg": -1.2, "yaw_deg": 45.0,

@@ -213,24 +213,47 @@ SIM_HZ              = 10     # simulation tick rate
 HEADING_SMOOTH      = 0.25   # heading interpolation factor per tick
 
 # ---------------------------------------------------------------------------
-# Default walking route  (UIUC Engineering Quad loop, ~500 m)
+# Default walking route  (UIUC octagonal demo loop, ~1 200 m)
+#
+# 8 waypoints placed at every 45° around a 200 m radius circle so that a
+# different maneuver — and therefore a different belt-motor direction — fires
+# at each corner.  One complete lap exercises all 8 motor positions.
+#
+# Motor directions demonstrated:
+#   Waypoint A (N)  → turn-slight-right → front_right motor
+#   Waypoint B (NE) → turn-right        → right motor
+#   Waypoint C (E)  → turn-sharp-right  → back_right motor
+#   Waypoint D (SE) → uturn-left        → back motor
+#   Waypoint E (S)  → turn-sharp-left   → back_left motor
+#   Waypoint F (SW) → turn-left         → left motor
+#   Waypoint G (W)  → turn-slight-left  → front_left motor
+#   Waypoint H (NW) → straight          → front motor (continue)
 # ---------------------------------------------------------------------------
 
 DEFAULT_ROUTE: list[dict] = [
-    {"lat": 40.11280, "lng": -88.22690, "name": "Grainger Library"},
-    {"lat": 40.11340, "lng": -88.22570, "name": "Illinois St / Green St"},
-    {"lat": 40.11390, "lng": -88.22470, "name": "Siebel Center"},
-    {"lat": 40.11310, "lng": -88.22400, "name": "Clark St"},
-    {"lat": 40.11200, "lng": -88.22440, "name": "Engineering Hall"},
-    {"lat": 40.11110, "lng": -88.22550, "name": "Green St / Wright St"},
-    {"lat": 40.11170, "lng": -88.22670, "name": "Wright St heading north"},
-    {"lat": 40.11280, "lng": -88.22690, "name": "Back at Grainger"},
+    {"lat": 40.11430, "lng": -88.22600, "name": "A – North (start)"},
+    {"lat": 40.11380, "lng": -88.22434, "name": "B – North-East"},
+    {"lat": 40.11250, "lng": -88.22366, "name": "C – East"},
+    {"lat": 40.11120, "lng": -88.22434, "name": "D – South-East"},
+    {"lat": 40.11070, "lng": -88.22600, "name": "E – South"},
+    {"lat": 40.11120, "lng": -88.22766, "name": "F – South-West"},
+    {"lat": 40.11250, "lng": -88.22834, "name": "G – West"},
+    {"lat": 40.11380, "lng": -88.22766, "name": "H – North-West"},
+    {"lat": 40.11430, "lng": -88.22600, "name": "A – North (finish)"},
 ]
 
-# Turn maneuvers that match each waypoint (what action to take AT that waypoint)
+# Maneuver executed AT each waypoint → maps to the motor direction fired
+# during the 50 m "execute" window before each corner.
 DEFAULT_MANEUVERS: list[str] = [
-    "turn-right", "turn-right", "turn-right", "turn-right",
-    "turn-right", "turn-right", "straight",   "straight",
+    "turn-slight-right",  # A  → front_right
+    "turn-right",         # B  → right
+    "turn-sharp-right",   # C  → back_right
+    "uturn-left",         # D  → back
+    "turn-sharp-left",    # E  → back_left
+    "turn-left",          # F  → left
+    "turn-slight-left",   # G  → front_left
+    "straight",           # H  → front  (last straight home)
+    "straight",           # finish
 ]
 
 # ---------------------------------------------------------------------------
@@ -250,8 +273,8 @@ sim_state: dict[str, Any] = {
     "running":       False,
     "lat":           DEFAULT_ROUTE[0]["lat"],
     "lng":           DEFAULT_ROUTE[0]["lng"],
-    "heading":       90.0,      # degrees (0 = north, 90 = east)
-    "target_heading": 90.0,
+    "heading":       60.0,      # degrees (0 = north, 90 = east); A→B leg is ~60° NE
+    "target_heading": 60.0,
     "waypoint_index": 0,
     "route":         DEFAULT_ROUTE,
     "maneuvers":     DEFAULT_MANEUVERS,

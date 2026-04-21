@@ -65,8 +65,8 @@ def _all_tof_clear() -> dict:
 
 def _all_mmwave_clear() -> dict:
     return {
-        "front": {"targets": 0, "range_m": 0.0, "speed_ms": 0.0, "energy": 0},
-        "back":  {"targets": 0, "range_m": 0.0, "speed_ms": 0.0, "energy": 0},
+        "front": {"presence": False, "det_state": 0},
+        "back":  {"presence": False, "det_state": 0},
     }
 
 
@@ -279,7 +279,7 @@ class TestNavHybridFusion:
         """mmWave front at 8 m → front hemisphere motors get ALERT."""
         pkt = _base_packet("body")
         pkt["mmwave_sensors"]["front"] = {
-            "targets": 1, "range_m": 8.0, "speed_ms": 0.1, "energy": 7000
+            "presence": True, "det_state": 2, "dist_cm": 800, "energy": 7000, "frames": 4
         }
         data = _post_nav(client, pkt).get_json()
         for d in MMWAVE_COVERAGE["front"]:
@@ -290,7 +290,7 @@ class TestNavHybridFusion:
     def test_mmwave_back_detection(self, client):
         pkt = _base_packet("body")
         pkt["mmwave_sensors"]["back"] = {
-            "targets": 1, "range_m": 10.0, "speed_ms": 0.0, "energy": 4000
+            "presence": True, "det_state": 2, "dist_cm": 1000, "energy": 4000, "frames": 3
         }
         data = _post_nav(client, pkt).get_json()
         for d in MMWAVE_COVERAGE["back"]:
@@ -304,7 +304,7 @@ class TestNavHybridFusion:
             "distance_mm": 1000, "avg": 1000, "min": 990, "max": 1010, "count": 50
         }
         pkt["mmwave_sensors"]["front"] = {
-            "targets": 1, "range_m": 7.0, "speed_ms": 0.05, "energy": 5000
+            "presence": True, "det_state": 2, "dist_cm": 700, "energy": 5000, "frames": 4
         }
         data = _post_nav(client, pkt).get_json()
         m = next(m for m in data["motors"] if m["direction"] == "front")
@@ -319,7 +319,7 @@ class TestNavHybridFusion:
             "distance_mm": 4000, "avg": 4000, "min": 3990, "max": 4010, "count": 50
         }
         pkt["mmwave_sensors"]["front"] = {
-            "targets": 1, "range_m": 2.0, "speed_ms": 0.1, "energy": 6000
+            "presence": True, "det_state": 2, "dist_cm": 200, "energy": 6000, "frames": 4
         }
         data = _post_nav(client, pkt).get_json()
         m = next(m for m in data["motors"] if m["direction"] == "front")
@@ -330,7 +330,7 @@ class TestNavHybridFusion:
         """Left and right motors must NOT be influenced by front/back mmWave."""
         pkt = _base_packet("body")
         pkt["mmwave_sensors"]["front"] = {
-            "targets": 1, "range_m": 6.0, "speed_ms": 0.0, "energy": 3000
+            "presence": True, "det_state": 2, "dist_cm": 600, "energy": 3000, "frames": 2
         }
         data = _post_nav(client, pkt).get_json()
         for direction in ("left", "right"):
@@ -341,7 +341,7 @@ class TestNavHybridFusion:
         """mmWave at exactly 5 m → ALERT (CAUTION threshold is < 5.0 m, strict)."""
         pkt = _base_packet("body")
         pkt["mmwave_sensors"]["front"] = {
-            "targets": 1, "range_m": 5.0, "speed_ms": 0.0, "energy": 2000
+            "presence": True, "det_state": 2, "dist_cm": 500, "energy": 2000, "frames": 2
         }
         data = _post_nav(client, pkt).get_json()
         m = next(m for m in data["motors"] if m["direction"] == "front")
@@ -352,10 +352,10 @@ class TestNavHybridFusion:
     def test_both_mmwave_sensors_active(self, client):
         pkt = _base_packet("body")
         pkt["mmwave_sensors"]["front"] = {
-            "targets": 1, "range_m": 7.0, "speed_ms": 0.1, "energy": 5000
+            "presence": True, "det_state": 2, "dist_cm": 700, "energy": 5000, "frames": 4
         }
         pkt["mmwave_sensors"]["back"] = {
-            "targets": 1, "range_m": 9.0, "speed_ms": 0.0, "energy": 3000
+            "presence": True, "det_state": 2, "dist_cm": 900, "energy": 3000, "frames": 2
         }
         data = _post_nav(client, pkt).get_json()
         front_m = next(m for m in data["motors"] if m["direction"] == "front")
