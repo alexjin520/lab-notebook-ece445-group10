@@ -1,22 +1,7 @@
 #include <Wire.h>
 #include "driver/temperature_sensor.h"   // ESP32-S3 internal temp sensor
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <ArduinoJson.h>
-#include <time.h>               // POSIX time — used for NTP Unix timestamp
 #include <Adafruit_VL53L1X.h>    // VL53L1X 4m ToF distance sensor
 #include <Adafruit_DRV2605.h>    // DRV2605L haptic motor driver
-
-// ── WiFi & Server configuration ──────────────────────────────────────────────
-#define WIFI_SSID       "Verizon-SM-S901U-FA93"
-#define WIFI_PASSWORD   "cacz115/"
-#define SERVER_URL      "http://10.206.194.152:5000/nav"
-#define HTTP_INTERVAL   1000   // ms between HTTP POSTs  (1 Hz — testing)
-
-// ── NTP configuration ────────────────────────────────────────────────────────
-#define NTP_SERVER      "pool.ntp.org"
-#define NTP_GMT_OFFSET  0      // UTC
-#define NTP_DST_OFFSET  0
 
 // ── Pin definitions (matches schematic I2C0 bus) ─────────────────────────────
 #define I2C_SDA       7
@@ -516,134 +501,6 @@ static float readTempC() {
 }
 
 
-// ── HTTP POST helper — conforms to server /nav JSON schema ──────────────────
-static void sendNavData(float voltage, float soc, float tempC, uint32_t freeHeap) {
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  HTTPClient http;
-  http.begin(SERVER_URL);
-  http.setReuse(true);
-  http.addHeader("Content-Type", "application/json");
-  http.setConnectTimeout(80);
-  http.setTimeout(80);
-
-  StaticJsonDocument<2048> doc;
-
-  doc["device_id"] = "esp32_power";
-  doc["module"]    = "body";
-  struct timeval tv;
-  gettimeofday(&tv, nullptr);
-  uint64_t unix_ms = (uint64_t)tv.tv_sec * 1000ULL + tv.tv_usec / 1000ULL;
-  doc["timestamp"] = unix_ms;
-  doc["uptime_ms"] = (uint32_t)millis();
-
-  // ToF sensors
-  JsonObject tofObj = doc.createNestedObject("tof_sensors");
-  for (uint8_t i = 0; i < 8; i++) {
-    if (!tofs[i].present || tofs[i].count == 0) {
-      tofObj.createNestedObject(tofs[i].name);
-    } else {
-      JsonObject s = tofObj.createNestedObject(tofs[i].name);
-      s["distance_mm"] = tofs[i].last_mm;
-      s["count"]       = tofs[i].count;
-      s["min"]         = tofs[i].min_mm;
-      s["avg"]         = (int16_t)(tofs[i].sum_mm / tofs[i].count);
-      s["max"]         = tofs[i].max_mm;
-    }
-  }
-
-  // mmWave radar sensors
-  JsonObject mmwObj = doc.createNestedObject("mmwave_sensors");
-  for (uint8_t i = 0; i < 2; i++) {
-    RadarSensor& r = radars[i];
-    JsonObject rj = mmwObj.createNestedObject(r.name);
-    rj["presence"]   = r.presence;
-    rj["det_state"]  = r.detState;   // 0=none, 1=stationary, 2=moving
-    if (r.frameCount > 0) {
-      rj["dist_cm"]  = r.distCm;
-      rj["energy"]   = r.energy;
-      rj["frames"]   = r.frameCount;
-    }
-  }
-
-  doc.createNestedObject("imu");  // not on this board
-
-  // Haptic motor states
-  JsonObject hapticObj = doc.createNestedObject("haptic_motors");
-  for (uint8_t i = 0; i < 8; i++) {
-    if (!drvs[i].present) {
-      hapticObj.createNestedObject(drvs[i].dir);
-    } else {
-      JsonObject h = hapticObj.createNestedObject(drvs[i].dir);
-      h["rtp"]  = drvs[i].rtp;
-      const char* zone = "CLEAR";
-      if      (drvs[i].rtp >= 127) zone = "CRITICAL";
-      else if (drvs[i].rtp >= 70)  zone = "WARNING";
-      else if (drvs[i].rtp >= 30)  zone = "CAUTION";
-      h["zone"] = zone;
-    }
-  }
-
-  // Power / system data
-  JsonObject battery = doc.createNestedObject("battery");
-  battery["voltage_v"] = serialized(String(voltage, 3));
-  battery["soc_pct"]   = serialized(String(soc,     1));
-
-  JsonObject system = doc.createNestedObject("system");
-  system["die_temp_c"]  = serialized(String(tempC, 1));
-  system["free_heap_b"] = freeHeap;
-  system["wifi_rssi"]   = WiFi.RSSI();
-
-  String body;
-  serializeJson(doc, body);
-
-  int code = http.POST(body);
-  if (code > 0) {
-    Serial.print("[HTTP] POST /nav => "); Serial.println(code);
-
-    if (code == 200) {
-      String resp = http.getString();
-
-      StaticJsonDocument<2048> resp_doc;
-      DeserializationError err = deserializeJson(resp_doc, resp);
-      if (err) {
-        Serial.print("[HTTP] JSON parse error: "); Serial.println(err.c_str());
-      } else {
-        // ── Hazard summary ──────────────────────────────────────────────
-        int   hazardLevel = resp_doc["hazard"]["level"] | -1;
-        const char* hazardLabel = resp_doc["hazard"]["label"] | "?";
-        Serial.print("[NAV]  hazard="); Serial.print(hazardLabel);
-        Serial.print(" (level="); Serial.print(hazardLevel); Serial.println(")");
-
-        // ── Motor commands from server (print only) ──────────────────────
-        JsonArray motors = resp_doc["motors"].as<JsonArray>();
-        for (JsonObject m : motors) {
-          const char* dir     = m["direction"] | "?";
-          bool        active  = m["active"]    | false;
-          int         intens  = m["intensity"] | 0;
-          const char* zone    = m["zone"]      | "?";
-          float       dist_m  = m["distance_m"]| -1.0f;
-          Serial.print("[NAV]    motor dir="); Serial.print(dir);
-          Serial.print(" active="); Serial.print(active ? "Y" : "N");
-          Serial.print(" intensity="); Serial.print(intens);
-          Serial.print(" zone="); Serial.print(zone);
-          if (dist_m >= 0) { Serial.print(" dist="); Serial.print(dist_m, 3); Serial.print("m"); }
-          Serial.println();
-        }
-
-        // ── Latency ─────────────────────────────────────────────────────
-        float latency = resp_doc["latency_ms"] | -1.0f;
-        if (latency >= 0) {
-          Serial.print("[NAV]  latency="); Serial.print(latency, 1); Serial.println("ms");
-        }
-      }
-    }
-  } else {
-    Serial.print("[HTTP] Error: "); Serial.println(http.errorToString(code));
-  }
-  http.end();
-}
-
 // ═════════════════════════════════════════════════════════════════════════════
 void setup() {
   Serial.begin(115200);
@@ -856,6 +713,27 @@ void setup() {
   Serial.println("  s/sw/w/nw → MUX ch 4/5/6/7   (back/back_left/left/front_left)");
   Serial.println("  NOTE: Motors initialised but RTP kept at 0 (silent) — haptic update disabled.");
   initDrvMotors();
+
+  // Per-motor sequential buzz test — each motor individually at RTP=64 for 500ms
+  Serial.println("  Motor connection test: buzzing each motor individually at RTP=64 for 500ms...");
+  for (uint8_t i = 0; i < 8; i++) {
+    Serial.print("    Testing "); Serial.print(drvs[i].dir);
+    Serial.print(" (MUX ch "); Serial.print(drvs[i].mux_ch); Serial.print("): ");
+    if (!drvs[i].present) {
+      Serial.println("SKIP (not detected)");
+      continue;
+    }
+    muxSelectDrv(drvs[i].mux_ch);
+    delayMicroseconds(500);
+    drvDev[i].setRealtimeValue(64);
+    Serial.println("BUZZING...");
+    delay(5000);
+    drvDev[i].setRealtimeValue(0);
+    drvs[i].rtp = 0;
+    muxSelectDrv(0xFF);
+    delay(100);   // brief gap between motors so you can feel the difference
+  }
+  Serial.println("  Motor test complete — all motors silenced.");
   Serial.println();
 
   // ── TEST 10: C4001 24 GHz mmWave Radar Sensors ────────────────────────────
@@ -867,39 +745,6 @@ void setup() {
     Serial.print("    "); Serial.print(radars[i].name);
     Serial.print(" OUT pin → ");
     Serial.println(radars[i].presence ? "PRESENCE DETECTED" : "no presence");
-  }
-  Serial.println();
-
-  // ── WiFi connection ───────────────────────────────────────────────────────
-  Serial.print("Connecting to WiFi: "); Serial.println(WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  int wifiTries = 0;
-  while (WiFi.status() != WL_CONNECTED && wifiTries < 20) {
-    delay(500); Serial.print("."); wifiTries++;
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println();
-    Serial.print("  [PASS] WiFi connected — IP: "); Serial.println(WiFi.localIP());
-    Serial.print("  Posting to: "); Serial.println(SERVER_URL);
-    configTime(NTP_GMT_OFFSET, NTP_DST_OFFSET, NTP_SERVER);
-    Serial.print("  Syncing NTP time");
-    struct tm ti;
-    int ntpTries = 0;
-    while (!getLocalTime(&ti) && ntpTries++ < 20) {
-      delay(500); Serial.print(".");
-    }
-    if (ntpTries < 20) {
-      char tbuf[32];
-      strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S UTC", &ti);
-      Serial.println();
-      Serial.print("  [PASS] NTP synced: "); Serial.println(tbuf);
-    } else {
-      Serial.println();
-      Serial.println("  [WARN] NTP sync failed — timestamps will be 0-based");
-    }
-  } else {
-    Serial.println();
-    Serial.println("  [WARN] WiFi connection failed — HTTP POST disabled");
   }
   Serial.println();
 
@@ -917,16 +762,6 @@ void loop() {
 
   // ── Update haptic motors from latest ToF readings ── DISABLED ────────
   // updateHaptics();
-
-  // ── HTTP POST at 10 Hz ────────────────────────────────────────────────────
-  static unsigned long lastPost = 0;
-  if (now - lastPost >= HTTP_INTERVAL) {
-    lastPost = now;
-    float voltage = fuelVoltage();
-    float soc     = fuelSOC();
-    float tempC   = readTempC();
-    sendNavData(voltage, soc, tempC, ESP.getFreeHeap());
-  }
 
   // ── Serial live print every 3 s (purely for monitoring, does not gate POST) ─
   static unsigned long lastPrint = 0;

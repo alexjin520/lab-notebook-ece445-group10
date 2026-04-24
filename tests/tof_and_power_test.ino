@@ -11,11 +11,11 @@
 #define WIFI_SSID       "Verizon-SM-S901U-FA93"
 #define WIFI_PASSWORD   "cacz115/"
 #define SERVER_URL      "http://10.206.194.152:5000/nav"
-#define HTTP_INTERVAL   1000   // ms between HTTP POSTs  (1 Hz — testing)
+#define HTTP_INTERVAL   100    // ms between HTTP POSTs  (10 Hz)
 
 // ── NTP configuration ────────────────────────────────────────────────────────
 #define NTP_SERVER      "pool.ntp.org"
-#define NTP_GMT_OFFSET  0      // UTC
+#define NTP_GMT_OFFSET  0      // UTC; change to local offset in seconds if needed
 #define NTP_DST_OFFSET  0
 
 // ── Pin definitions (matches schematic I2C0 bus) ─────────────────────────────
@@ -26,180 +26,6 @@
 // ── TCA9548A I2C Multiplexer ──────────────────────────────────────────────────
 #define MUX_ADDR      0x77   // ToF MUX: A0/A1/A2 all tied to 3.3V → 0x77
 #define DRV_MUX_ADDR  0x70   // DRV MUX: A0/A1/A2 all GND → 0x70
-
-// ── C4001 24 GHz mmWave Radar ────────────────────────────────────────────────
-// Two Seeed C4001 sensors; each has a UART interface + a digital OUT pin.
-// ESP32 Serial1 → Radar 1,  Serial2 → Radar 2.
-// OUT pin: HIGH = human presence detected, LOW = no presence.
-#define RADAR1_TX   39    // ESP32 TX1 → C4001 #1 RX  (module pad 32)
-#define RADAR1_RX   40    // ESP32 RX1 ← C4001 #1 TX  (module pad 33)
-#define RADAR1_OUT  15    // C4001 #1 OUT digital pin   (module pad 8)
-#define RADAR2_TX   41    // ESP32 TX2 → C4001 #2 RX  (module pad 34)
-#define RADAR2_RX   42    // ESP32 RX2 ← C4001 #2 TX  (module pad 35)
-#define RADAR2_OUT  16    // C4001 #2 OUT digital pin   (module pad 9)
-#define RADAR_BAUD  115200
-
-// C4001 frame parser state
-enum RadarParseState : uint8_t {
-  RPS_IDLE,       // waiting for 0x53
-  RPS_HDR2,       // waiting for 0x59
-  RPS_FUNC,       // function byte
-  RPS_CMD,        // command byte
-  RPS_LEN_H,      // length high byte
-  RPS_LEN_L,      // length low byte
-  RPS_DATA,       // collecting data bytes
-  RPS_CHECKSUM,   // checksum byte
-  RPS_TAIL1,      // 0x54
-  RPS_TAIL2,      // 0x43
-};
-
-struct RadarSensor {
-  const char*    name;
-  HardwareSerial* serial;
-  uint8_t         txPin;
-  uint8_t         rxPin;
-  uint8_t         outPin;
-  bool            uartOk;       // UART initialised
-  bool            presence;     // current OUT-pin reading
-  uint32_t        presenceMs;   // millis() when last presence edge went HIGH
-  // Parsed UART values (updated by frame parser)
-  uint8_t         detState;     // 0=no one, 1=stationary, 2=moving
-  uint16_t        distCm;       // target distance in cm (0 = unknown)
-  uint8_t         energy;       // motion energy 0-100
-  uint32_t        frameCount;   // valid frames decoded
-  uint32_t        lastFrameMs;  // millis() of last valid frame
-  // Frame parser state machine
-  RadarParseState pstate;
-  uint8_t         pFunc;
-  uint8_t         pCmd;
-  uint16_t        pLen;
-  uint16_t        pDataIdx;
-  uint8_t         pData[32];
-  uint8_t         pChecksum;
-  uint8_t         pCalcCk;      // running checksum (additive sum mod 256 of func..data)
-  // Raw byte capture — first 64 bytes for protocol diagnostics
-  uint8_t         rawDump[64];
-  uint8_t         rawDumpLen;   // 0-64; stops at 64
-};
-
-static RadarSensor radars[2] = {
-  { "radar1", &Serial1, RADAR1_TX, RADAR1_RX, RADAR1_OUT,
-    false, false, 0,   0, 0, 0, 0, 0,   RPS_IDLE, 0,0,0,0,{},0,0, {}, 0 },
-  { "radar2", &Serial2, RADAR2_TX, RADAR2_RX, RADAR2_OUT,
-    false, false, 0,   0, 0, 0, 0, 0,   RPS_IDLE, 0,0,0,0,{},0,0, {}, 0 },
-};
-
-// Initialise both C4001 sensors
-static void initRadars() {
-  for (uint8_t i = 0; i < 2; i++) {
-    RadarSensor& r = radars[i];
-    pinMode(r.outPin, INPUT_PULLDOWN);  // pull-down prevents floating HIGH false positives
-    r.serial->begin(RADAR_BAUD, SERIAL_8N1, r.rxPin, r.txPin);
-    delay(100);
-    // A freshly powered C4001 sends an init frame within ~100 ms.
-    // Accept any byte on RX as proof the UART link is alive.
-    r.uartOk = (r.serial->available() > 0);
-    r.presence = (digitalRead(r.outPin) == HIGH);
-    Serial.print("    "); Serial.print(r.name);
-    Serial.print("  TX="); Serial.print(r.txPin);
-    Serial.print(" RX="); Serial.print(r.rxPin);
-    Serial.print(" OUT="); Serial.print(r.outPin); Serial.print(": ");
-    if (r.uartOk) {
-      Serial.println("UART OK");
-    } else {
-      // UART byte not yet seen — sensor may still be booting; mark present
-      // optimistically so polling continues, but note it.
-      Serial.println("UART no init byte yet (sensor may still be booting)");
-      r.uartOk = true;   // allow continued polling
-    }
-  }
-}
-
-// Dispatch a fully-decoded C4001 frame into the RadarSensor fields.
-// MR24HPC1/C4001 detection report frames use func=0x80:
-//   cmd=0x01 → presence          data[0]: 0=no one, 1=presence
-//   cmd=0x02 → motion state      data[0]: 0=none, 1=stationary, 2=moving
-//   cmd=0x03 → body movement     data[0]: 0-100 energy
-//   cmd=0x06 → target distance   data[0..1]: uint16 big-endian, unit = cm
-static void radarHandleFrame(RadarSensor& r) {
-  r.frameCount++;
-  r.lastFrameMs = millis();
-  if (r.pFunc != 0x80) return;  // only handle detection frames
-  switch (r.pCmd) {
-    case 0x01:  // presence
-      if (r.pLen >= 1) {
-        r.presence = (r.pData[0] != 0x00);
-        if (r.presence) r.presenceMs = millis();
-      }
-      break;
-    case 0x02:  // motion state
-      if (r.pLen >= 1) r.detState = r.pData[0];
-      break;
-    case 0x03:  // body movement energy
-      if (r.pLen >= 1) r.energy = r.pData[0];
-      break;
-    case 0x06:  // distance
-      if (r.pLen >= 2)
-        r.distCm = ((uint16_t)r.pData[0] << 8) | r.pData[1];
-      break;
-  }
-}
-
-// Feed one byte into the C4001 frame state machine.
-// Frame: 53 59 [func] [cmd] [len_h] [len_l] [data...] [checksum] 54 43
-// Checksum = additive sum of func + cmd + len_h + len_l + data[0..n-1], mod 256
-static void radarFeedByte(RadarSensor& r, uint8_t b) {
-  // Capture first 64 bytes for diagnostics
-  if (r.rawDumpLen < sizeof(r.rawDump)) r.rawDump[r.rawDumpLen++] = b;
-
-  switch (r.pstate) {
-    case RPS_IDLE:    if (b == 0x53) r.pstate = RPS_HDR2;   break;
-    case RPS_HDR2:    r.pstate = (b == 0x59) ? RPS_FUNC : RPS_IDLE; break;
-    case RPS_FUNC:    r.pFunc = b; r.pCalcCk  = b; r.pstate = RPS_CMD;    break;
-    case RPS_CMD:     r.pCmd  = b; r.pCalcCk += b; r.pstate = RPS_LEN_H;  break;
-    case RPS_LEN_H:   r.pLen  = (uint16_t)b << 8; r.pCalcCk += b; r.pstate = RPS_LEN_L; break;
-    case RPS_LEN_L:
-      r.pLen |= b; r.pCalcCk += b; r.pDataIdx = 0;
-      r.pstate = (r.pLen == 0) ? RPS_CHECKSUM : RPS_DATA;
-      break;
-    case RPS_DATA:
-      r.pCalcCk += b;
-      if (r.pDataIdx < sizeof(r.pData)) r.pData[r.pDataIdx] = b;
-      r.pDataIdx++;
-      if (r.pDataIdx >= r.pLen) r.pstate = RPS_CHECKSUM;
-      break;
-    case RPS_CHECKSUM:
-      r.pChecksum = b;
-      r.pstate = RPS_TAIL1;
-      break;
-    case RPS_TAIL1:   r.pstate = (b == 0x54) ? RPS_TAIL2 : RPS_IDLE; break;
-    case RPS_TAIL2:
-      if (b == 0x43 && r.pChecksum == (r.pCalcCk & 0xFF))
-        radarHandleFrame(r);
-      r.pstate = RPS_IDLE;
-      break;
-    default: r.pstate = RPS_IDLE; break;
-  }
-}
-
-// Poll OUT pins and parse UART frames — call every loop()
-static void pollRadars() {
-  for (uint8_t i = 0; i < 2; i++) {
-    RadarSensor& r = radars[i];
-    if (!r.uartOk) continue;
-
-    // OUT pin — hardware presence line (fallback when UART not parsed yet)
-    bool outHigh = (digitalRead(r.outPin) == HIGH);
-    if (outHigh && !r.presence) r.presenceMs = millis();
-    // Only trust OUT pin if no UART frames have arrived yet
-    if (r.frameCount == 0) r.presence = outHigh;
-
-    // Parse all pending UART bytes
-    while (r.serial->available()) {
-      radarFeedByte(r, (uint8_t)r.serial->read());
-    }
-  }
-}
 
 // ── Haptic thresholds — RTP intensity driven from ToF distance ———————————
 #define HAPTIC_CRITICAL_MM   300   // ≤ 300 mm → max buzz  (RTP 127)
@@ -227,14 +53,14 @@ static Adafruit_VL53L1X tofDev[8];
 //                  name          mux_ch  xshut  present  last   cnt    min    max  sum  err
 // XSHUT pin assignments — avoid strapping pins GPIO45 (VDD_SPI sel) and GPIO46 (ROM log)
 static TofSensor tofs[8] = {
-  { "front",           0,   19,   false,   -1,    0,  32767,    0,   0,   0 },  // F   GPIO19  (schematic: XSHUT_F)
-  { "front_right",     5,   46,   false,   -1,    0,  32767,    0,   0,   0 },  // FR  GPIO46  (schematic: XSHUT_FR — moved; GPIO16 now RADAR_OUT_2)
+  { "front",           0,    1,   false,   -1,    0,  32767,    0,   0,   0 },  // F   GPIO1
+  { "front_right",     5,    2,   false,   -1,    0,  32767,    0,   0,   0 },  // FR  GPIO2
   { "right",           1,   38,   false,   -1,    0,  32767,    0,   0,   0 },  // R   GPIO38
-  { "back_right",      7,   25,   false,   -1,    0,  32767,    0,   0,   0 },  // BR  GPIO25  (schematic: XSHUT_BR)
-  { "back",            2,   21,   false,   -1,    0,  32767,    0,   0,   0 },  // B   GPIO21  (schematic: XSHUT_B)
-  { "back_left",       6,   24,   false,   -1,    0,  32767,    0,   0,   0 },  // BL  GPIO24  (schematic: XSHUT_BL)
-  { "left",            3,   22,   false,   -1,    0,  32767,    0,   0,   0 },  // L   GPIO22  (schematic: XSHUT_L)
-  { "front_left",      4,    3,   false,   -1,    0,  32767,    0,   0,   0 },  // FL  GPIO3   (schematic: XSHUT_FL)
+  { "back_right",      7,   48,   false,   -1,    0,  32767,    0,   0,   0 },  // BR  GPIO48
+  { "back",            2,   13,   false,   -1,    0,  32767,    0,   0,   0 },  // B   GPIO13
+  { "back_left",       6,   47,   false,   -1,    0,  32767,    0,   0,   0 },  // BL  GPIO47
+  { "left",            3,   14,   false,   -1,    0,  32767,    0,   0,   0 },  // L   GPIO14
+  { "front_left",      4,   21,   false,   -1,    0,  32767,    0,   0,   0 },  // FL  GPIO21
 };
 
 // ── MUX helper ───────────────────────────────────────────────────────────────
@@ -515,20 +341,29 @@ static float readTempC() {
   return t;
 }
 
-
 // ── HTTP POST helper — conforms to server /nav JSON schema ──────────────────
-static void sendNavData(float voltage, float soc, float tempC, uint32_t freeHeap) {
+//
+// Required top-level fields:
+//   device_id, module, tof_sensors, mmwave_sensors, imu, timestamp
+//
+// ToF readings are populated from the 8-sensor array (via TCA9548A MUX).
+// mmwave and imu are not on this board — sent as empty objects {}.
+// Battery / thermal data are extra top-level keys logged by the server.
+static void sendPowerData(float voltage, float soc, float tempC, uint32_t freeHeap) {
   if (WiFi.status() != WL_CONNECTED) return;
 
   HTTPClient http;
   http.begin(SERVER_URL);
-  http.setReuse(true);
+  http.setReuse(true);            // keep-alive — avoids TCP handshake every call
   http.addHeader("Content-Type", "application/json");
-  http.setConnectTimeout(80);
-  http.setTimeout(80);
+  http.setConnectTimeout(80);     // TCP connect must succeed within 80 ms
+  http.setTimeout(80);            // total response wait within 80 ms
 
-  StaticJsonDocument<2048> doc;
+  // 1536 B: 8 ToF × ~5 fields + 8 DRV × ~2 fields + battery/system overhead
+  StaticJsonDocument<1536> doc;
 
+  // ── Required identification fields ────────────────────────────────────────
+  // timestamp = Unix ms (NTP-synced) — server computes latency_ms = recv - timestamp
   doc["device_id"] = "esp32_power";
   doc["module"]    = "body";
   struct timeval tv;
@@ -537,11 +372,11 @@ static void sendNavData(float voltage, float soc, float tempC, uint32_t freeHeap
   doc["timestamp"] = unix_ms;
   doc["uptime_ms"] = (uint32_t)millis();
 
-  // ToF sensors
+  // ── ToF sensor readings (empty object {} = absent or no data yet) ─────────
   JsonObject tofObj = doc.createNestedObject("tof_sensors");
   for (uint8_t i = 0; i < 8; i++) {
     if (!tofs[i].present || tofs[i].count == 0) {
-      tofObj.createNestedObject(tofs[i].name);
+      tofObj.createNestedObject(tofs[i].name);   // {} — absent / no data yet
     } else {
       JsonObject s = tofObj.createNestedObject(tofs[i].name);
       s["distance_mm"] = tofs[i].last_mm;
@@ -551,28 +386,14 @@ static void sendNavData(float voltage, float soc, float tempC, uint32_t freeHeap
       s["max"]         = tofs[i].max_mm;
     }
   }
+  doc.createNestedObject("mmwave_sensors"); // {} — not on this board
+  doc.createNestedObject("imu");            // {} — not on this board
 
-  // mmWave radar sensors
-  JsonObject mmwObj = doc.createNestedObject("mmwave_sensors");
-  for (uint8_t i = 0; i < 2; i++) {
-    RadarSensor& r = radars[i];
-    JsonObject rj = mmwObj.createNestedObject(r.name);
-    rj["presence"]   = r.presence;
-    rj["det_state"]  = r.detState;   // 0=none, 1=stationary, 2=moving
-    if (r.frameCount > 0) {
-      rj["dist_cm"]  = r.distCm;
-      rj["energy"]   = r.energy;
-      rj["frames"]   = r.frameCount;
-    }
-  }
-
-  doc.createNestedObject("imu");  // not on this board
-
-  // Haptic motor states
+  // ── Haptic motor states — current RTP value + zone for each direction ———
   JsonObject hapticObj = doc.createNestedObject("haptic_motors");
   for (uint8_t i = 0; i < 8; i++) {
     if (!drvs[i].present) {
-      hapticObj.createNestedObject(drvs[i].dir);
+      hapticObj.createNestedObject(drvs[i].dir);  // {} — not populated
     } else {
       JsonObject h = hapticObj.createNestedObject(drvs[i].dir);
       h["rtp"]  = drvs[i].rtp;
@@ -584,13 +405,13 @@ static void sendNavData(float voltage, float soc, float tempC, uint32_t freeHeap
     }
   }
 
-  // Power / system data
+  // ── Power-system data (extra fields, logged by server, ignored by algo) ───
   JsonObject battery = doc.createNestedObject("battery");
-  battery["voltage_v"] = serialized(String(voltage, 3));
-  battery["soc_pct"]   = serialized(String(soc,     1));
+  battery["voltage_v"]  = serialized(String(voltage, 3));
+  battery["soc_pct"]    = serialized(String(soc,     1));
 
   JsonObject system = doc.createNestedObject("system");
-  system["die_temp_c"]  = serialized(String(tempC, 1));
+  system["die_temp_c"]  = serialized(String(tempC,   1));
   system["free_heap_b"] = freeHeap;
   system["wifi_rssi"]   = WiFi.RSSI();
 
@@ -600,44 +421,6 @@ static void sendNavData(float voltage, float soc, float tempC, uint32_t freeHeap
   int code = http.POST(body);
   if (code > 0) {
     Serial.print("[HTTP] POST /nav => "); Serial.println(code);
-
-    if (code == 200) {
-      String resp = http.getString();
-
-      StaticJsonDocument<2048> resp_doc;
-      DeserializationError err = deserializeJson(resp_doc, resp);
-      if (err) {
-        Serial.print("[HTTP] JSON parse error: "); Serial.println(err.c_str());
-      } else {
-        // ── Hazard summary ──────────────────────────────────────────────
-        int   hazardLevel = resp_doc["hazard"]["level"] | -1;
-        const char* hazardLabel = resp_doc["hazard"]["label"] | "?";
-        Serial.print("[NAV]  hazard="); Serial.print(hazardLabel);
-        Serial.print(" (level="); Serial.print(hazardLevel); Serial.println(")");
-
-        // ── Motor commands from server (print only) ──────────────────────
-        JsonArray motors = resp_doc["motors"].as<JsonArray>();
-        for (JsonObject m : motors) {
-          const char* dir     = m["direction"] | "?";
-          bool        active  = m["active"]    | false;
-          int         intens  = m["intensity"] | 0;
-          const char* zone    = m["zone"]      | "?";
-          float       dist_m  = m["distance_m"]| -1.0f;
-          Serial.print("[NAV]    motor dir="); Serial.print(dir);
-          Serial.print(" active="); Serial.print(active ? "Y" : "N");
-          Serial.print(" intensity="); Serial.print(intens);
-          Serial.print(" zone="); Serial.print(zone);
-          if (dist_m >= 0) { Serial.print(" dist="); Serial.print(dist_m, 3); Serial.print("m"); }
-          Serial.println();
-        }
-
-        // ── Latency ─────────────────────────────────────────────────────
-        float latency = resp_doc["latency_ms"] | -1.0f;
-        if (latency >= 0) {
-          Serial.print("[NAV]  latency="); Serial.print(latency, 1); Serial.println("ms");
-        }
-      }
-    }
   } else {
     Serial.print("[HTTP] Error: "); Serial.println(http.errorToString(code));
   }
@@ -678,9 +461,9 @@ void setup() {
 
   bool cpuOk   = (cpuMHz >= 80);
   bool ramOk   = (freeHeap > 100000);
-  // Flash chip is 16 MB GigaDevice (confirmed by esptool flash-id).
-  // Accept 15–17 MB range to allow for reporting variance.
-  bool flashOk = (flashSzKB >= 14336 && flashSzKB <= 17408);
+  // N8 has 8 MB (8192 KB) flash; allow ±1 MB for reporting variance.
+  // 16384 KB means IDE Flash Size is set to 16 MB — change to 8 MB in Tools menu.
+  bool flashOk = (flashSzKB >= 7168 && flashSzKB <= 9216);
   // N8 has NO PSRAM — presence of PSRAM would indicate wrong board config
   bool psramOk = (psramSz == 0);
 
@@ -690,8 +473,12 @@ void setup() {
   if (ramOk)   printPass("Free heap > 100 KB");
   else         printFail("Free heap too low");
 
-  if (flashOk) printPass("Flash ~16 MB detected (GigaDevice chip confirmed)");
-  else         printFail("Flash size unexpected — set Tools > Flash Size > 16MB in Arduino IDE");
+  if (flashOk) printPass("Flash ~8 MB detected (N8 variant confirmed)");
+  else {
+    if (flashSzKB < 7168)  printFail("Flash < 7 MB — set Flash Size to 8MB in Arduino IDE");
+    else if (flashSzKB == 16384) printFail("Flash reports 16 MB — change Tools > Flash Size to 8MB in Arduino IDE");
+    else                   printFail("Flash size unexpected — check board selection");
+  }
 
   if (psramOk) printPass("No PSRAM — correct for N8 variant");
   else         printFail("PSRAM detected — set PSRAM to Disabled in Arduino IDE");
@@ -845,8 +632,8 @@ void setup() {
 
   // ── TEST 8: TCA9548A + VL53L1X ToF Sensors ───────────────────────────────
   Serial.println("[TEST 8] TCA9548A MUX (0x77) + 8× VL53L1X ToF");
-  Serial.println("  F/FR/R/BR → MUX ch 0/5/1/7  XSHUT GPIO 19/46/38/25");
-  Serial.println("  B/BL/L/FL → MUX ch 2/6/3/4  XSHUT GPIO 21/24/22/3");
+  Serial.println("  F/FR/R/BR → MUX ch 0/5/1/7  XSHUT GPIO 1/2/38/48");
+  Serial.println("  B/BL/L/FL → MUX ch 2/6/3/4  XSHUT GPIO 13/47/14/21");
   initToFSensors();
   Serial.println();
 
@@ -854,20 +641,8 @@ void setup() {
   Serial.println("[TEST 9] DRV2605L Haptic Motors (MUX 0x70)");
   Serial.println("  n/ne/e/se → MUX ch 0/1/2/3   (front/front_right/right/back_right)");
   Serial.println("  s/sw/w/nw → MUX ch 4/5/6/7   (back/back_left/left/front_left)");
-  Serial.println("  NOTE: Motors initialised but RTP kept at 0 (silent) — haptic update disabled.");
+  Serial.println("  Thresholds: CRITICAL≤300mm(RTP127) WARNING≤600mm(70) CAUTION≤1000mm(30)");
   initDrvMotors();
-  Serial.println();
-
-  // ── TEST 10: C4001 24 GHz mmWave Radar Sensors ────────────────────────────
-  Serial.println("[TEST 10] C4001 24 GHz mmWave Radar Sensors");
-  Serial.println("  radar1: TX=GPIO39 RX=GPIO40 OUT=GPIO15  (Serial1)");
-  Serial.println("  radar2: TX=GPIO41 RX=GPIO42 OUT=GPIO16  (Serial2)");
-  initRadars();
-  for (uint8_t i = 0; i < 2; i++) {
-    Serial.print("    "); Serial.print(radars[i].name);
-    Serial.print(" OUT pin → ");
-    Serial.println(radars[i].presence ? "PRESENCE DETECTED" : "no presence");
-  }
   Serial.println();
 
   // ── WiFi connection ───────────────────────────────────────────────────────
@@ -881,6 +656,8 @@ void setup() {
     Serial.println();
     Serial.print("  [PASS] WiFi connected — IP: "); Serial.println(WiFi.localIP());
     Serial.print("  Posting to: "); Serial.println(SERVER_URL);
+
+    // Sync system clock via NTP so timestamps are Unix ms (needed for latency)
     configTime(NTP_GMT_OFFSET, NTP_DST_OFFSET, NTP_SERVER);
     Serial.print("  Syncing NTP time");
     struct tm ti;
@@ -895,14 +672,13 @@ void setup() {
       Serial.print("  [PASS] NTP synced: "); Serial.println(tbuf);
     } else {
       Serial.println();
-      Serial.println("  [WARN] NTP sync failed — timestamps will be 0-based");
+      Serial.println("  [WARN] NTP sync failed — timestamps will be 0-based (no latency calc)");
     }
   } else {
     Serial.println();
     Serial.println("  [WARN] WiFi connection failed — HTTP POST disabled");
   }
   Serial.println();
-
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -912,20 +688,17 @@ void loop() {
   // ── Poll all 8 ToF sensors (non-blocking — skips if dataReady() is false) ──
   readToFSensors();
 
-  // ── Poll mmWave radar OUT pins + drain UART buffers ───────────────────────
-  pollRadars();
+  // ── Update haptic motors from latest ToF readings ──────────────────────
+  updateHaptics();
 
-  // ── Update haptic motors from latest ToF readings ── DISABLED ────────
-  // updateHaptics();
-
-  // ── HTTP POST at 10 Hz ────────────────────────────────────────────────────
+  // ── HTTP POST at 10 Hz (runs every loop iteration, independent of serial) ─
   static unsigned long lastPost = 0;
   if (now - lastPost >= HTTP_INTERVAL) {
     lastPost = now;
     float voltage = fuelVoltage();
     float soc     = fuelSOC();
     float tempC   = readTempC();
-    sendNavData(voltage, soc, tempC, ESP.getFreeHeap());
+    sendPowerData(voltage, soc, tempC, ESP.getFreeHeap());
   }
 
   // ── Serial live print every 3 s (purely for monitoring, does not gate POST) ─
@@ -981,39 +754,5 @@ void loop() {
     Serial.println();
   } else {
     Serial.println("[ToF]  No sensors present");
-  }
-
-  // Radar presence status with parsed UART data
-  for (uint8_t i = 0; i < 2; i++) {
-    RadarSensor& r = radars[i];
-    Serial.print("[Radar/"); Serial.print(r.name); Serial.print("] ");
-    // Presence
-    if (r.presence) {
-      Serial.print("PRESENT ");
-      static const char* stateStr[] = { "(no-motion)", "(stationary)", "(moving)" };
-      if (r.detState <= 2) Serial.print(stateStr[r.detState]);
-    } else {
-      Serial.print("clear");
-    }
-    // UART-parsed values
-    if (r.frameCount > 0) {
-      Serial.print(" | dist:");
-      if (r.distCm > 0) { Serial.print(r.distCm); Serial.print("cm"); }
-      else Serial.print("--cm");
-      Serial.print(" energy:"); Serial.print(r.energy);
-      Serial.print(" frames:"); Serial.print(r.frameCount);
-      Serial.print(" age:"); Serial.print((millis() - r.lastFrameMs)); Serial.print("ms");
-    } else if (r.rawDumpLen > 0) {
-      // No valid frames yet — dump raw bytes to help diagnose protocol mismatch
-      Serial.print(" | UART frames:0  raw[");
-      Serial.print(r.rawDumpLen); Serial.print("B]: ");
-      for (uint8_t j = 0; j < r.rawDumpLen; j++) {
-        if (r.rawDump[j] < 0x10) Serial.print('0');
-        Serial.print(r.rawDump[j], HEX); Serial.print(' ');
-      }
-    } else {
-      Serial.print(" | UART frames: 0  no bytes received (check TX/RX wiring)");
-    }
-    Serial.println();
   }
 }
