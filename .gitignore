@@ -5,7 +5,7 @@ tests/__pycache__
 logs/
 
 # API keys – never commit the real config, only the example template
-frontend/config.js# macOS
+frontend/config.js
 .DS_Store
 .AppleDouble
 .LSOverride
