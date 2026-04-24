@@ -679,3 +679,199 @@ input[type="text"][readonly] {
   #map-container { display: none; }
   #sidebar { width: 100vw; position: relative; height: 100vh; }
 }
+
+/* ── Place Details Panel ──────────────────────────────────────────────────── */
+#place-panel {
+  position: absolute;
+  top: 0; right: 0;
+  width: 320px;
+  height: 100%;
+  background: var(--bg-panel);
+  border-left: 1px solid var(--border-light);
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transform: translateX(100%);
+  transition: transform 0.28s cubic-bezier(.4,0,.2,1);
+  box-shadow: -6px 0 32px rgba(0,0,0,.45);
+}
+#place-panel.open { transform: translateX(0); }
+
+#place-panel-close {
+  position: absolute; top: 10px; right: 10px; z-index: 2;
+  background: rgba(13,17,23,.7); border: 1px solid var(--border-light);
+  border-radius: 50%; width: 32px; height: 32px;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; color: var(--text-primary); transition: var(--transition);
+}
+#place-panel-close:hover { background: var(--bg-hover); }
+
+#place-panel-photo {
+  width: 100%; height: 160px; flex-shrink: 0;
+  background: var(--bg-elevated);
+  overflow: hidden; position: relative;
+}
+#place-panel-photo img {
+  width: 100%; height: 100%; object-fit: cover;
+}
+#place-panel-photo .no-photo {
+  display: flex; align-items: center; justify-content: center;
+  height: 100%; color: var(--text-muted); font-size: 12px;
+}
+
+#place-panel-body {
+  flex: 1; overflow-y: auto; padding: 16px 16px 24px;
+}
+#place-panel-body::-webkit-scrollbar { width: 4px; }
+#place-panel-body::-webkit-scrollbar-thumb { background: var(--border-light); border-radius: 2px; }
+
+.pp-name {
+  font-size: 17px; font-weight: 700; color: var(--text-primary);
+  line-height: 1.3; margin-bottom: 4px;
+}
+.pp-type {
+  display: inline-block; font-size: 10px; font-weight: 600;
+  letter-spacing: .5px; text-transform: uppercase;
+  color: var(--accent); background: rgba(79,142,247,.12);
+  border: 1px solid rgba(79,142,247,.25); border-radius: 4px;
+  padding: 2px 8px; margin-bottom: 10px;
+}
+.pp-rating {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 13px; color: var(--warn); margin-bottom: 10px;
+}
+.pp-rating .count { color: var(--text-muted); font-size: 11px; }
+.pp-status-row {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 12px; font-size: 12px;
+}
+.pp-open  { color: var(--success); font-weight: 600; }
+.pp-closed { color: var(--danger);  font-weight: 600; }
+.pp-today-hours { color: var(--text-muted); }
+
+.pp-divider {
+  border: none; border-top: 1px solid var(--border);
+  margin: 12px 0;
+}
+.pp-row {
+  display: flex; gap: 10px; align-items: flex-start;
+  margin-bottom: 10px; font-size: 12px; color: var(--text-primary);
+}
+.pp-row svg { flex-shrink: 0; margin-top: 1px; color: var(--text-muted); }
+.pp-row a  { color: var(--accent); text-decoration: none; word-break: break-all; }
+.pp-row a:hover { text-decoration: underline; }
+
+.pp-hours-toggle {
+  display: flex; align-items: center; gap: 6px;
+  cursor: pointer; font-size: 12px; color: var(--accent);
+  background: none; border: none; padding: 0; margin-bottom: 6px;
+}
+.pp-hours-list {
+  display: none; background: var(--bg-elevated);
+  border-radius: 6px; padding: 8px 10px;
+  font-size: 11px; line-height: 1.8; color: var(--text-muted);
+  margin-bottom: 10px;
+}
+.pp-hours-list.open { display: block; }
+.pp-hours-list .today { color: var(--text-primary); font-weight: 600; }
+
+.pp-actions {
+  display: flex; flex-direction: column; gap: 8px; margin-top: 14px;
+}
+.pp-btn-dest {
+  padding: 10px; border: none; border-radius: 7px;
+  background: var(--accent); color: #fff;
+  font-size: 13px; font-weight: 700; cursor: pointer; transition: var(--transition);
+}
+.pp-btn-dest:hover { background: #3a7ae8; }
+.pp-btn-maps {
+  padding: 9px; border: 1px solid var(--border-light); border-radius: 7px;
+  background: transparent; color: var(--text-muted);
+  font-size: 12px; font-weight: 600; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  text-decoration: none; transition: var(--transition);
+}
+.pp-btn-maps:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+/* ── Google Maps InfoWindow — dark theme ──────────────────────────────────── */
+/* Outer bubble container */
+.gm-style .gm-style-iw-c {
+  background: #161b27 !important;
+  border: 1px solid #2e3650 !important;
+  border-radius: 10px !important;
+  box-shadow: 0 8px 32px rgba(0,0,0,.6) !important;
+  padding: 0 !important;
+  max-width: 280px !important;
+}
+/* Scroll wrapper */
+.gm-style .gm-style-iw-d {
+  overflow: hidden !important;
+  max-height: none !important;
+}
+/* Tail / arrow pointing down */
+.gm-style .gm-style-iw-t::after {
+  background: #161b27 !important;
+  box-shadow: -2px 2px 4px rgba(0,0,0,.4) !important;
+}
+/* Hide the default close button (we use our own or the native X) */
+.gm-style .gm-ui-hover-effect {
+  filter: invert(0.7) !important;
+  opacity: 0.7 !important;
+  top: 4px !important;
+  right: 4px !important;
+}
+.gm-style .gm-ui-hover-effect:hover { opacity: 1 !important; }
+/* Hide the header bar Google added in newer API versions */
+.gm-style .gm-style-iw-ch { display: none !important; }
+.gm-style .gm-style-iw-chr { display: none !important; }
+
+/* ── InfoWindow card content ─────────────────────────────────────────────── */
+.iw-card {
+  padding: 14px 16px 12px;
+  font-family: system-ui, sans-serif;
+  color: #e8ecf4;
+  min-width: 200px;
+}
+.iw-name {
+  font-size: 14px;
+  font-weight: 700;
+  color: #e8ecf4;
+  margin-bottom: 3px;
+  line-height: 1.3;
+}
+.iw-type {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .5px;
+  text-transform: uppercase;
+  color: #4f8ef7;
+  background: rgba(79,142,247,.12);
+  border: 1px solid rgba(79,142,247,.25);
+  border-radius: 4px;
+  padding: 1px 7px;
+  margin-bottom: 7px;
+}
+.iw-addr {
+  font-size: 11px;
+  color: #7a88a4;
+  line-height: 1.45;
+  margin-top: 5px;
+}
+.iw-rating {
+  font-size: 12px;
+  color: #e6a817;
+  margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.iw-rating span { color: #b0b8cc; font-size: 11px; }
+.iw-hours {
+  font-size: 11px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.iw-hours.open  { color: #3dba6e; }
+.iw-hours.closed { color: #e05c5c; }
