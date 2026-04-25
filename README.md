@@ -45,8 +45,24 @@ lab-notebook-ece445-group10/
 ├── docs/                    # Design documentation
 │   ├── ALGORITHM_DESIGN.md
 │   └── TESTS_REFERENCE.md
-└── ECE445_group10_design (1).pdf
+├── ECE445_group10_design (1).pdf
+├── head_module_1.png        # Head module assembly photo
+├── head_module_2.png
+├── waist_module_1.png       # Waist module assembly photo
+└── waist_module_2.png
 ```
+
+## Hardware
+
+| Head Module | Head Module |
+|-------------|-------------|
+| ![](head_module_1.png) | ![](head_module_2.png) |
+
+| Waist Module | Waist Module |
+|--------------|--------------|
+| ![](waist_module_1.png) | ![](waist_module_2.png) |
+
+---
 
 ## System Overview
 
