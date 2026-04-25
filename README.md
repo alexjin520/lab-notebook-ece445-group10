@@ -11,6 +11,7 @@ A wearable obstacle-detection system for visually impaired users, consisting of 
 ```
 lab-notebook-ece445-group10/
 ├── notebooks/               # Lab notebooks (ECE 445 requirement)
+│   ├── images/              # Shared hardware photos and diagrams
 │   ├── alex/
 │   │   └── README.md
 │   ├── jiateng/
@@ -37,7 +38,8 @@ lab-notebook-ece445-group10/
 │   ├── tof_and_power_test.ino
 │   ├── minimal_test.ino
 │   ├── test_integration.py
-│   └── test_unit.py
+│   ├── test_unit.py
+│   └── __init__.py
 ├── sketch_mar9a/            # Arduino sketch (Mar 9 version)
 │   └── sketch_mar9a.ino
 ├── docs/                    # Design documentation

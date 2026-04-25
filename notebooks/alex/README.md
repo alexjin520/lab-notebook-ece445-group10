@@ -167,7 +167,7 @@ Purchased **Dupont wires**, **electrical tape**, and other physical assembly mat
 
 ---
 
-## Entry 7 — April 14–18, 2026
+## Entry 7 — April 23, 2026
 
 ### Objectives
 - Complete physical assembly of the waist module and head module
@@ -177,10 +177,27 @@ Purchased **Dupont wires**, **electrical tape**, and other physical assembly mat
 
 #### Physical Assembly
 
-Completed the full physical assembly of both the **waist module** and the **head module** using the corrected PCBs, Dupont wires, and tape purchased the previous week. Components secured and wired according to the system design:
+Completed the full physical assembly of both the **waist module** and the **head module** using the corrected PCBs, Dupont wires, and tape. Components secured and wired according to the system design.
 
-- **Waist module**: ESP32-S3, mmWave radar (UART), ToF sensors (I2C), haptic motor driver, belt vibration motors, power management circuitry
-- **Head module**: ESP32-S3, mmWave radar (UART), ToF sensors (I2C), haptic motor drivers, head-mounted vibration motors, power circuitry
+**Figure 1 — Waist Module component layout (reference diagram)**
+
+![Waist Module Diagram](../images/waist_module_diagram.png)
+
+- **Waist module**: ESP32-S3 MCU, IWR6843 mmWave radar (UART), VL53L1X ToF sensors ×2 (I2C), ICM-42688-P 6-DoF IMU (I2C), NEO-6M GPS (UART), haptic motor drivers, 8× belt vibration motors, 3.7V LiPo battery + PM board (3.3V/5V regulators), toggle power switch
+
+**Figure 2 — Head Module component layout (reference diagram)**
+
+![Head Module Diagram](../images/head_module_diagram.png)
+
+- **Head module** (built into knit beanie): ESP32-S3 MCU, IWR6843 mmWave radar (UART), VL53L1X ToF sensors ×2 (I2C), ICM-42688-P 6-DoF IMU (I2C), haptic motor drivers, 8× head vibration motors, 3.7V LiPo battery + PM board, toggle power switch
+
+**Figure 3 — Head module assembly in progress (April 23, 2026)**
+
+![Head Module Assembly 1](../images/head_assembly_apr23_1.png)
+
+**Figure 4 — Head module assembly completed (April 23, 2026)**
+
+![Head Module Assembly 2](../images/head_assembly_apr23_2.png)
 
 #### Subsystem Testing
 
@@ -188,7 +205,7 @@ Tested each subsystem individually after assembly:
 
 | Subsystem | Result |
 |-----------|--------|
-| Power delivery (3.3V and 5V rails) | ✓ Pass — within ±5% tolerance |
+| Power delivery (3.3V and 5V rails) | ✓ Pass |
 | Head module ToF sensor I2C communication | ✓ Pass |
 | Waist module ToF sensor I2C communication | ✓ Pass |
 | Haptic motor activation (head module) | ✓ Pass |
@@ -196,16 +213,16 @@ Tested each subsystem individually after assembly:
 | Wi-Fi connectivity (both modules to server) | ✓ Pass |
 | Physical wearable stability | ✓ Pass |
 
-All tested subsystems operating as expected. Wiring was adjusted during testing to reduce loose connections and improve mechanical reliability.
+All subsystems operating as expected. Wiring adjusted to reduce loose connections.
 
 #### Remaining Issue
 
-The **IMU (6-DoF)** component had not yet arrived. IMU integration and the navigation heading subsystem cannot be completed until the part is received.
+The **IMU (ICM-42688-P)** had not yet arrived at time of assembly. IMU slots are wired and ready; integration pending component delivery.
 
 ### Next Steps
 - Wait for IMU delivery
 - Begin IMU integration as soon as it arrives
-- Run full-system integration tests with both modules operating simultaneously
+- Run full-system tests with both modules operating simultaneously
 
 ---
 
@@ -217,9 +234,19 @@ The **IMU (6-DoF)** component had not yet arrived. IMU integration and the navig
 
 ### Record
 
-The **6-DoF IMU modules** arrived today. The IMUs will be integrated into both the waist and head modules via I2C, consistent with the design document specification.
+The **ICM-42688-P 6-DoF IMU modules** arrived today. The IMUs will be integrated into both the waist and head modules via I2C.
 
-Planned integration steps:
+Also brought both assembled modules into the lab for further testing and wiring cleanup.
+
+**Figure 5 — Waist module assembly (April 25, 2026)**
+
+![Waist Module Assembly 1](../images/waist_assembly_apr25_1.png)
+
+**Figure 6 — Waist module wiring detail (April 25, 2026)**
+
+![Waist Module Assembly 2](../images/waist_assembly_apr25_2.png)
+
+Planned IMU integration steps:
 1. Connect IMU to the I2C bus on each module (alongside ToF sensors)
 2. Assign unique I2C addresses if needed
 3. Flash firmware update to initialize IMU at ≥50 Hz sampling rate
