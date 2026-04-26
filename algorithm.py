@@ -95,7 +95,30 @@ logger = logging.getLogger("omnisense.algorithm")
 TOF_MAX_RANGE_M   = 5.0     # metres  – VL53L1X useful range
 MMWAVE_MAX_RANGE_M = 12.0   # metres  – TI mmWave useful range
 TOF_INVALID_MM    = 8190    # mm      – VL53L1X "no target" sentinel
-TILT_THRESHOLD_DEG = 15.0   # degrees – tilt beyond which a channel is suppressed
+TILT_THRESHOLD_DEG = 15.0   # degrees – tilt beyond which a channel WOULD be suppressed
+                            # (only used when IMU_TILT_SUPPRESS_ENABLED is True)
+
+# Whether to drop sensor channels whose IMU pitch/roll is past TILT_THRESHOLD_DEG.
+# Disabled by default so the dashboard always shows the raw fused readings;
+# tilt-aware safety is still represented through the body orientation block
+# the dashboard renders separately. Set to True to re-enable the legacy
+# behaviour (suppressed(pitch_tilt) / suppressed(roll_tilt) sources).
+IMU_TILT_SUPPRESS_ENABLED = False
+
+# ── IMU motion thresholds (ICM-20948) ────────────────────────────────────────
+# These mirror the firmware-side computeIMUOrientation() classifiers so the
+# server validates them rather than blindly trusting the boolean flag from the
+# wire — keeps the system robust if a future firmware widens the thresholds.
+TURN_RATE_THRESHOLD_DPS = 30.0   # |gyro_z| above this → user is yawing
+FALL_ACCEL_G_LOW        = 0.40   # |accel| below this → free-fall window
+FALL_ACCEL_G_HIGH       = 2.50   # |accel| above this → impact spike
+STILL_ACCEL_TOL_G       = 0.05   # |accel-1g| below this AND ↓ → stationary
+STILL_GYRO_TOL_DPS      = 5.0    # |gyro|     below this AND ↑ → stationary
+
+# When the user is actively turning, briefly soften zone classifications by
+# this many "steps" (CRITICAL→DANGER→WARNING→…). Prevents single-frame false
+# alarms from sensors sweeping past a wall during a head/body rotation.
+TURN_ZONE_SOFTEN_STEPS = 1
 
 # 8 compass directions in clockwise order
 DIRECTIONS: list[str] = [
@@ -174,6 +197,78 @@ HAZARD_LEVEL: dict[str, int] = {
     Zone.ALERT:    1,
     Zone.CLEAR:    0,
 }
+
+
+# ---------------------------------------------------------------------------
+# Heading / turn helpers — used by IMU-aware navigation in server.py
+# ---------------------------------------------------------------------------
+
+def wrap_180(deg: float) -> float:
+    """Wrap an angle to the half-open range (-180, +180]."""
+    deg = (deg + 180.0) % 360.0 - 180.0
+    # Pythons modulo gives (-180, 180], which is exactly what we want
+    return deg
+
+
+# Maps an 8-direction compass command back to the signed yaw delta the
+# command implies (positive = clockwise / right turn, negative = left).
+# "front" = no turn, "back" = full 180° (sign is arbitrary so we use +180).
+_COMMAND_DELTA_DEG: dict[str, float] = {
+    "front":         0.0,
+    "front_right":  45.0,
+    "right":        90.0,
+    "back_right":  135.0,
+    "back":        180.0,
+    "back_left":  -135.0,
+    "left":        -90.0,
+    "front_left":  -45.0,
+    "stop":          0.0,
+}
+
+
+def relative_bearing_to_command(
+    target_world_deg: float,
+    user_yaw_deg: float,
+) -> tuple[str, float]:
+    """
+    Translate an absolute compass bearing (e.g. from Google Maps) into a
+    body-frame haptic command using the user's current heading.
+
+    Parameters
+    ----------
+    target_world_deg : Desired compass bearing (0=N, 90=E, 180=S, 270=W).
+    user_yaw_deg     : The IMU's tilt-compensated yaw (same convention).
+
+    Returns
+    -------
+    (command, delta_deg)
+        command   : one of front / front_right / right / back_right /
+                    back / back_left / left / front_left
+        delta_deg : signed turn angle in (-180, +180]; positive = clockwise
+
+    8-sector mapping (45° wide each, ±22.5° around the centre):
+        |delta|  ≤ 22.5° → front
+                 ≤ 67.5° → front_right (delta>0) / front_left (delta<0)
+                 ≤112.5° → right       / left
+                 ≤157.5° → back_right  / back_left
+                 else    → back
+    """
+    delta = wrap_180(target_world_deg - user_yaw_deg)
+    abs_d = abs(delta)
+    if   abs_d <= 22.5:  cmd = "front"
+    elif abs_d <= 67.5:  cmd = "front_right" if delta > 0 else "front_left"
+    elif abs_d <= 112.5: cmd = "right"       if delta > 0 else "left"
+    elif abs_d <= 157.5: cmd = "back_right"  if delta > 0 else "back_left"
+    else:                cmd = "back"
+    return cmd, delta
+
+
+def expected_turn_angle_deg(command: str) -> float:
+    """
+    Magnitude of yaw the user is expected to execute for a turn command.
+    Used as the target for turn-confirmation integration.
+    """
+    return abs(_COMMAND_DELTA_DEG.get(command, 0.0))
 
 
 def classify_distance(distance_m: float, module: str = "body") -> str:
@@ -289,7 +384,7 @@ def _parse_imu(imu_data: dict) -> dict:
     """
     Parse the ``imu`` sub-object.
 
-    Expected shape::
+    Minimum schema (legacy / MPU-6050 compatible)::
 
         "imu": {
             "roll_deg":  2.5,
@@ -297,14 +392,55 @@ def _parse_imu(imu_data: dict) -> dict:
             "yaw_deg":   45.0,
             "accel_x": 0.01, "accel_y": 0.02, "accel_z": 9.8
         }
+
+    Extended schema (ICM-20948 firmware, v2 onward) — fully optional. Each
+    extra field has a safe default so the algorithm degrades gracefully when
+    the firmware sends only the legacy block (or nothing at all)::
+
+        "imu": {
+            ...legacy fields...,
+            "heading_cardinal": "SE",
+            "gyro_x":  1.7,  "gyro_y":  7.8,  "gyro_z":  17.2,
+            "mag_x": -10.1,  "mag_y":  47.1,  "mag_z": -15.9,
+            "temp_c":   32.1,
+            "accel_g":  1.16,  "gyro_dps": 19.0,
+            "motion_state":   "moving",     # "still"|"moving"|"turning"|"falling"
+            "is_still":       false,
+            "is_turning":     false,
+            "is_falling":     false,
+            "mag_calibrated": false,
+            "read_count":     12, "err_count": 0
+        }
     """
     return {
-        "roll_deg":  float(imu_data.get("roll_deg",  0.0)),
-        "pitch_deg": float(imu_data.get("pitch_deg", 0.0)),
-        "yaw_deg":   float(imu_data.get("yaw_deg",   0.0)),
-        "accel_x":   float(imu_data.get("accel_x",   0.0)),
-        "accel_y":   float(imu_data.get("accel_y",   0.0)),
-        "accel_z":   float(imu_data.get("accel_z",   9.81)),
+        # ── Legacy / required ──────────────────────────────────────────────
+        "roll_deg":         float(imu_data.get("roll_deg",  0.0)),
+        "pitch_deg":        float(imu_data.get("pitch_deg", 0.0)),
+        "yaw_deg":          float(imu_data.get("yaw_deg",   0.0)),
+        "accel_x":          float(imu_data.get("accel_x",   0.0)),
+        "accel_y":          float(imu_data.get("accel_y",   0.0)),
+        "accel_z":          float(imu_data.get("accel_z",   9.81)),
+        # ── Extended (ICM-20948) — safe defaults for legacy packets ────────
+        "heading_cardinal": str(imu_data.get("heading_cardinal", "")),
+        "gyro_x":           float(imu_data.get("gyro_x", 0.0)),
+        "gyro_y":           float(imu_data.get("gyro_y", 0.0)),
+        "gyro_z":           float(imu_data.get("gyro_z", 0.0)),
+        "mag_x":            float(imu_data.get("mag_x",  0.0)),
+        "mag_y":            float(imu_data.get("mag_y",  0.0)),
+        "mag_z":            float(imu_data.get("mag_z",  0.0)),
+        "temp_c":           float(imu_data.get("temp_c", 0.0)),
+        "accel_g":          float(imu_data.get("accel_g",  1.0)),
+        "gyro_dps":         float(imu_data.get("gyro_dps", 0.0)),
+        "motion_state":     str(imu_data.get("motion_state", "unknown")),
+        "is_still":         bool(imu_data.get("is_still",       False)),
+        "is_turning":       bool(imu_data.get("is_turning",     False)),
+        "is_falling":       bool(imu_data.get("is_falling",     False)),
+        "mag_calibrated":   bool(imu_data.get("mag_calibrated", False)),
+        "read_count":       int(imu_data.get("read_count", 0)),
+        "err_count":        int(imu_data.get("err_count", 0)),
+        # Whether this packet actually carried IMU data at all — used by the
+        # response builder to advertise availability to clients.
+        "_present":         bool(imu_data),
     }
 
 
@@ -427,6 +563,223 @@ def _apply_imu_compensation(
 
 
 # ---------------------------------------------------------------------------
+# IMU motion modifiers — turning suppression & fall detection
+# ---------------------------------------------------------------------------
+
+# Zones in order of severity (low→high) so we can step "downward" by N levels
+# when softening due to a transient turning motion.
+_ZONE_LADDER: list[str] = [
+    Zone.CLEAR, Zone.ALERT, Zone.CAUTION,
+    Zone.WARNING, Zone.DANGER, Zone.CRITICAL,
+]
+
+
+def _soften_zone(zone: str, steps: int) -> str:
+    """Drop ``zone`` by ``steps`` rungs on the severity ladder (clamped at CLEAR)."""
+    if steps <= 0 or zone not in _ZONE_LADDER:
+        return zone
+    idx = max(0, _ZONE_LADDER.index(zone) - steps)
+    return _ZONE_LADDER[idx]
+
+
+def _apply_imu_motion_modifiers(
+    fused: dict[str, dict],
+    imu: dict,
+    module: str = "body",
+) -> tuple[dict[str, dict], dict]:
+    """
+    Apply motion-derived adjustments to the fused direction map.
+
+    Two effects are applied (independent):
+
+    1. **Turning suppression** – when the IMU reports the user is actively
+       yawing (``|gyro_z| > TURN_RATE_THRESHOLD_DPS``), every direction's
+       zone is softened by ``TURN_ZONE_SOFTEN_STEPS``. Rationale: while the
+       user rotates their head/body, ToF/radar sensors briefly sweep past
+       walls and produce flicker alarms that vanish a frame later. Keeping
+       genuine close-range hazards above CRITICAL/DANGER ensures we never
+       miss a real obstacle — only WARNING/CAUTION are dampened.
+
+    2. **Fall detection** – combines firmware ``is_falling`` with a
+       server-side validation of the accel-magnitude window. Returned as a
+       dict alongside the modified fused map so ``_compute_hazard()`` can
+       prepend it to the alert list as the highest-priority alert.
+
+    Returns
+    -------
+    (fused_modified, motion_summary) where motion_summary is::
+
+        {
+            "is_turning": bool,
+            "is_falling": bool,
+            "is_still":   bool,
+            "soften_steps": int,                 # how many ladder rungs we dropped
+            "fall_alert": dict | None,           # alert payload if falling
+        }
+    """
+    result = {k: dict(v) for k, v in fused.items()}
+
+    # Server-side validation of the firmware booleans. Trust both, but only
+    # act on the conjunction so a stuck flag can't dominate. ``accel_g`` is
+    # the magnitude already computed on the firmware; we sanity-check it.
+    accel_g  = float(imu.get("accel_g",  1.0))
+    gyro_dps = float(imu.get("gyro_dps", 0.0))
+    gyro_z   = float(imu.get("gyro_z",   0.0))
+
+    is_turning_flag = bool(imu.get("is_turning", False))
+    is_falling_flag = bool(imu.get("is_falling", False))
+    is_still_flag   = bool(imu.get("is_still",   False))
+
+    is_turning = is_turning_flag and abs(gyro_z) > TURN_RATE_THRESHOLD_DPS
+    # Validated fall = firmware flag AND accel-magnitude is in either the
+    # free-fall window (|a| < LOW) or an impact-spike window (|a| > HIGH).
+    # The firmware only sets is_falling for free-fall, so this is mainly a
+    # defence-in-depth check that catches stuck flags.
+    is_falling = is_falling_flag and (accel_g < FALL_ACCEL_G_LOW or accel_g > FALL_ACCEL_G_HIGH)
+    is_still   = (
+        is_still_flag
+        and abs(accel_g - 1.0) < STILL_ACCEL_TOL_G
+        and gyro_dps < STILL_GYRO_TOL_DPS
+    )
+
+    # ── (1) Turning soften ───────────────────────────────────────────────
+    soften_steps = 0
+    if is_turning:
+        soften_steps = TURN_ZONE_SOFTEN_STEPS
+        logger.info(
+            "[VERIFY:IMU_TURN] device_module=%-4s gyro_z_dps=%+7.2f "
+            "threshold_dps=%.1f  soften_steps=%d  ← head/body actively rotating",
+            module, gyro_z, TURN_RATE_THRESHOLD_DPS, soften_steps,
+        )
+        for direction, reading in result.items():
+            new_zone = _soften_zone(reading["zone"], soften_steps)
+            if new_zone != reading["zone"]:
+                reading["zone"]      = new_zone
+                reading["vibration"] = VIBRATION_PATTERNS[new_zone].copy()
+                # Annotate so dashboards can show "softened by turning"
+                reading["source"]    = f"{reading['source']}(turn_soft)"
+
+    # ── (2) Fall detection ───────────────────────────────────────────────
+    fall_alert = None
+    if is_falling:
+        logger.warning(
+            "[VERIFY:IMU_FALL] device_module=%-4s accel_g=%.2f "
+            "(free-fall <%.2fg or impact >%.2fg)  ← FALL EVENT",
+            module, accel_g, FALL_ACCEL_G_LOW, FALL_ACCEL_G_HIGH,
+        )
+        fall_alert = {
+            "direction":  "all",
+            "zone":       Zone.CRITICAL,
+            "distance_m": 0.0,
+            "source":     "imu_fall_detect",
+            "kind":       "fall",
+            "accel_g":    round(accel_g, 2),
+        }
+
+    if is_still:
+        logger.debug(
+            "[VERIFY:IMU_STILL] device_module=%-4s accel_g=%.2f gyro_dps=%.1f "
+            "← stationary; haptics may suppress when CLEAR",
+            module, accel_g, gyro_dps,
+        )
+
+    return result, {
+        "is_turning":   is_turning,
+        "is_falling":   is_falling,
+        "is_still":     is_still,
+        "soften_steps": soften_steps,
+        "fall_alert":   fall_alert,
+    }
+
+
+def _empty_motion_summary() -> dict:
+    """
+    Return a no-motion summary, matching the shape produced by
+    ``_apply_imu_motion_modifiers``. Used as a stand-in when a module has
+    no IMU (e.g. our current build only has an ICM-20948 on the body), so
+    the merge / hazard logic can run unchanged.
+    """
+    return {
+        "is_turning":   False,
+        "is_falling":   False,
+        "is_still":     False,
+        "soften_steps": 0,
+        "fall_alert":   None,
+    }
+
+
+def _merge_motion_summaries(head_motion: dict, body_motion: dict) -> dict:
+    """
+    Combine per-module motion summaries into one for dual-module decisions.
+
+    Logical OR for the booleans (a fall detected on EITHER module is a fall),
+    max for the soften level, and the more-severe fall alert wins (head
+    preferred when both are present, since head has the alert headband).
+    """
+    fall_alert = head_motion.get("fall_alert") or body_motion.get("fall_alert")
+    return {
+        "is_turning":   bool(head_motion["is_turning"] or body_motion["is_turning"]),
+        "is_falling":   bool(head_motion["is_falling"] or body_motion["is_falling"]),
+        "is_still":     bool(head_motion["is_still"]   and body_motion["is_still"]),
+        "soften_steps": max(head_motion["soften_steps"], body_motion["soften_steps"]),
+        "fall_alert":   fall_alert,
+    }
+
+
+def _build_imu_response(imu: dict, motion: dict) -> dict:
+    """
+    Build the ``imu`` block returned to the ESP32 / dashboard.
+
+    Surfaces the legacy fields (so older clients keep working) plus the
+    derived motion state and a small "advice" sub-object the firmware can
+    use to drive UX decisions (e.g. silent-mode when stationary,
+    emergency-pattern when falling) without re-implementing the same
+    thresholds locally.
+    """
+    return {
+        # Presence flag — false means the firmware sent no IMU payload (e.g.
+        # the head module in our current build has no IMU). Dashboards use
+        # this to draw a "(not equipped)" placeholder instead of fake zeros.
+        "present":          bool(imu.get("_present", False)),
+        # Legacy (always present)
+        "roll_deg":         round(imu["roll_deg"],  2),
+        "pitch_deg":        round(imu["pitch_deg"], 2),
+        "yaw_deg":          round(imu["yaw_deg"],   2),
+        # Extended — only meaningful when ICM-20948 firmware is in use, but
+        # always echoed back for client convenience (defaults are harmless).
+        "heading_cardinal": imu.get("heading_cardinal", ""),
+        "accel_x":          round(imu.get("accel_x", 0.0),  2),
+        "accel_y":          round(imu.get("accel_y", 0.0),  2),
+        "accel_z":          round(imu.get("accel_z", 9.81), 2),
+        "gyro_x":           round(imu.get("gyro_x",  0.0),  1),
+        "gyro_y":           round(imu.get("gyro_y",  0.0),  1),
+        "gyro_z":           round(imu.get("gyro_z",  0.0),  1),
+        "mag_x":            round(imu.get("mag_x",   0.0),  1),
+        "mag_y":            round(imu.get("mag_y",   0.0),  1),
+        "mag_z":            round(imu.get("mag_z",   0.0),  1),
+        "accel_g":          round(imu.get("accel_g",  1.0), 2),
+        "gyro_dps":         round(imu.get("gyro_dps", 0.0), 1),
+        "temp_c":           round(imu.get("temp_c",   0.0), 1),
+        "motion_state":     imu.get("motion_state", "unknown"),
+        "is_still":         bool(motion.get("is_still",   False)),
+        "is_turning":       bool(motion.get("is_turning", False)),
+        "is_falling":       bool(motion.get("is_falling", False)),
+        "mag_calibrated":   bool(imu.get("mag_calibrated", False)),
+        # UX hints derived server-side. The firmware can act on these without
+        # knowing the exact threshold constants used here.
+        "advice": {
+            "silence_haptics": (
+                bool(motion.get("is_still", False))
+                # Only suggest silencing when nothing is in alert range; the
+                # caller already has the hazard dict to apply this gate too.
+            ),
+            "fall_emergency":  bool(motion.get("is_falling", False)),
+            "soften_steps":    int(motion.get("soften_steps", 0)),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Motor command generation
 # ---------------------------------------------------------------------------
 
@@ -477,9 +830,18 @@ def _generate_motor_commands(fused: dict[str, dict]) -> list[dict]:
 # Hazard summary
 # ---------------------------------------------------------------------------
 
-def _compute_hazard(fused: dict[str, dict]) -> dict:
+def _compute_hazard(
+    fused: dict[str, dict],
+    motion_summary: dict | None = None,
+) -> dict:
     """
     Derive the overall hazard level and an alert list from all fused readings.
+
+    Parameters
+    ----------
+    fused          : direction → reading dict produced by the fusion stage.
+    motion_summary : optional dict from ``_apply_imu_motion_modifiers`` —
+                     used to inject a top-priority FALL alert when present.
 
     Returns
     -------
@@ -489,13 +851,15 @@ def _compute_hazard(fused: dict[str, dict]) -> dict:
             "level": 3,          # 0 = CLEAR … 5 = CRITICAL
             "label": "WARNING",
             "alerts": [
+                {"direction": "all",   "zone": "CRITICAL", "kind": "fall", ...},
                 {"direction": "front", "zone": "WARNING",
                  "distance_m": 2.3, "source": "tof"},
                 ...
             ]
         }
 
-    Alerts are sorted most-critical first.
+    Alerts are sorted most-critical first; fall alerts always rank above
+    obstacle alerts at the same severity level.
     """
     alerts: list[dict] = []
     worst_level = 0
@@ -510,12 +874,25 @@ def _compute_hazard(fused: dict[str, dict]) -> dict:
                 "zone":       reading["zone"],
                 "distance_m": round(dist, 3) if dist is not None else None,
                 "source":     reading["source"],
+                "kind":       "obstacle",
             })
         if lvl > worst_level:
             worst_level = lvl
             worst_label = reading["zone"]
 
-    alerts.sort(key=lambda a: -HAZARD_LEVEL[a["zone"]])
+    # Inject the IMU-derived fall alert (if any). It always pegs hazard to
+    # CRITICAL because a falling user is the highest-priority event the
+    # system can report.
+    fall_alert = None
+    if motion_summary is not None:
+        fall_alert = motion_summary.get("fall_alert")
+    if fall_alert is not None:
+        alerts.insert(0, fall_alert)
+        worst_level = HAZARD_LEVEL[Zone.CRITICAL]
+        worst_label = Zone.CRITICAL
+
+    # Sort by zone severity, then put fall (kind=="fall") first within a tie.
+    alerts.sort(key=lambda a: (-HAZARD_LEVEL[a["zone"]], 0 if a.get("kind") == "fall" else 1))
     return {"level": worst_level, "label": worst_label, "alerts": alerts}
 
 
@@ -680,27 +1057,39 @@ def process_packet(data: dict[str, Any], state: dict, now_ms: float) -> dict:
     tof_distances  = _parse_tof_sensors(data.get("tof_sensors", {}))
     mmwave_detects = _parse_mmwave_sensors(data.get("mmwave_sensors", {}))
     imu            = _parse_imu(data.get("imu", {}))
+    has_imu        = bool(imu.get("_present"))
 
-    # [VERIFY:IMU_READ] – continuous yaw log for 2.2.3 orientation drift check
-    logger.info(
-        "[VERIFY:IMU_READ] device=%-14s module=%-4s "
-        "roll=%7.2f  pitch=%7.2f  yaw=%7.2f  accel_z=%.3f",
-        device_id, module,
-        imu["roll_deg"], imu["pitch_deg"], imu["yaw_deg"], imu["accel_z"],
-    )
+    # [VERIFY:IMU_READ] – continuous yaw log for 2.2.3 orientation drift check.
+    # Skip when this module has no IMU (avoids logging phantom zeros in the
+    # head-only deployment).
+    if has_imu:
+        logger.info(
+            "[VERIFY:IMU_READ] device=%-14s module=%-4s "
+            "roll=%7.2f  pitch=%7.2f  yaw=%7.2f  accel_z=%.3f",
+            device_id, module,
+            imu["roll_deg"], imu["pitch_deg"], imu["yaw_deg"], imu["accel_z"],
+        )
 
     # ── 3. Hybrid sensor fusion ──────────────────────────────────────────────
     fused = _fuse_sensor_data(tof_distances, mmwave_detects, module)
 
-    # ── 4. IMU tilt compensation ─────────────────────────────────────────────
-    fused = _apply_imu_compensation(fused, imu)
+    # ── 4a-b. IMU motion modifiers (only if equipped). Tilt-based channel
+    #         suppression is disabled by default so the dashboard always sees
+    #         every sensor reading; the body orientation panel + the suppress
+    #         flag in motion_state still convey tilt awareness.
+    if has_imu:
+        if IMU_TILT_SUPPRESS_ENABLED:
+            fused = _apply_imu_compensation(fused, imu)
+        fused, motion = _apply_imu_motion_modifiers(fused, imu, module)
+    else:
+        motion = _empty_motion_summary()
 
     # [VERIFY:FUSE] – per-direction fusion result for 2.2.3 distance accuracy
     _log_fused_directions(device_id, module, fused)
 
     # ── 5. Generate outputs ──────────────────────────────────────────────────
     motors = _generate_motor_commands(fused)
-    hazard = _compute_hazard(fused)
+    hazard = _compute_hazard(fused, motion)
 
     # [VERIFY:HAZARD_DETECT] – direction + zone for 2.2.2 classification check
     _log_hazard(device_id, module, hazard)
@@ -720,11 +1109,7 @@ def process_packet(data: dict[str, Any], state: dict, now_ms: float) -> dict:
         "module":     module,
         "hazard":     hazard,
         "motors":     motors,
-        "imu":        {
-            "roll_deg":  imu["roll_deg"],
-            "pitch_deg": imu["pitch_deg"],
-            "yaw_deg":   imu["yaw_deg"],
-        },
+        "imu":        _build_imu_response(imu, motion),
         "latency_ms": latency_ms,
     }
 
@@ -762,37 +1147,59 @@ def process_combined_packet(
     head_imu    = _parse_imu(head_data.get("imu", {}))
     body_imu    = _parse_imu(body_data.get("imu", {}))
 
-    # [VERIFY:IMU_READ] – log both module IMUs for orientation drift analysis (2.2.3)
-    logger.info(
-        "[VERIFY:IMU_READ] device=%-14s module=head "
-        "roll=%7.2f  pitch=%7.2f  yaw=%7.2f  accel_z=%.3f",
-        head_id,
-        head_imu["roll_deg"], head_imu["pitch_deg"],
-        head_imu["yaw_deg"],  head_imu["accel_z"],
-    )
-    logger.info(
-        "[VERIFY:IMU_READ] device=%-14s module=body "
-        "roll=%7.2f  pitch=%7.2f  yaw=%7.2f  accel_z=%.3f",
-        body_id,
-        body_imu["roll_deg"], body_imu["pitch_deg"],
-        body_imu["yaw_deg"],  body_imu["accel_z"],
-    )
+    head_has_imu = bool(head_imu.get("_present"))
+    body_has_imu = bool(body_imu.get("_present"))
+
+    # [VERIFY:IMU_READ] – orientation drift log (2.2.3). Skip the line for
+    # modules that didn't ship an IMU so the log isn't filled with phantom
+    # zeros (current build: ICM-20948 lives on the body only).
+    if head_has_imu:
+        logger.info(
+            "[VERIFY:IMU_READ] device=%-14s module=head "
+            "roll=%7.2f  pitch=%7.2f  yaw=%7.2f  accel_z=%.3f",
+            head_id,
+            head_imu["roll_deg"], head_imu["pitch_deg"],
+            head_imu["yaw_deg"],  head_imu["accel_z"],
+        )
+    if body_has_imu:
+        logger.info(
+            "[VERIFY:IMU_READ] device=%-14s module=body "
+            "roll=%7.2f  pitch=%7.2f  yaw=%7.2f  accel_z=%.3f",
+            body_id,
+            body_imu["roll_deg"], body_imu["pitch_deg"],
+            body_imu["yaw_deg"],  body_imu["accel_z"],
+        )
 
     # ── 2. Fuse and apply per-module IMU compensation ─────────────────────────
     #   Each module's tilt suppresses only its own readings, keeping the two
-    #   modules independent before the cross-module merge.
+    #   modules independent before the cross-module merge. A module without
+    #   an IMU passes through untouched and contributes a no-motion summary,
+    #   so it can never trigger a phantom turn / fall / tilt-suppress.
     head_fused = _fuse_sensor_data(head_tof, head_mmwave, module="head")
-    head_fused = _apply_imu_compensation(head_fused, head_imu)
+    if head_has_imu:
+        if IMU_TILT_SUPPRESS_ENABLED:
+            head_fused = _apply_imu_compensation(head_fused, head_imu)
+        head_fused, head_motion = _apply_imu_motion_modifiers(head_fused, head_imu, "head")
+    else:
+        head_motion = _empty_motion_summary()
 
     body_fused = _fuse_sensor_data(body_tof, body_mmwave, module="body")
-    body_fused = _apply_imu_compensation(body_fused, body_imu)
+    if body_has_imu:
+        if IMU_TILT_SUPPRESS_ENABLED:
+            body_fused = _apply_imu_compensation(body_fused, body_imu)
+        body_fused, body_motion = _apply_imu_motion_modifiers(body_fused, body_imu, "body")
+    else:
+        body_motion = _empty_motion_summary()
 
     # ── 3. Merge: safety-first min across both modules; head thresholds ───────
     fused = _merge_fused_dicts(head_fused, body_fused)
 
+    # ── 3b. Merge motion summaries — fall on EITHER module pegs hazard ───────
+    motion = _merge_motion_summaries(head_motion, body_motion)
+
     # ── 4. Generate outputs ───────────────────────────────────────────────────
     motors = _generate_motor_commands(fused)
-    hazard = _compute_hazard(fused)
+    hazard = _compute_hazard(fused, motion)
 
     # [VERIFY:FUSE] – merged per-direction result for distance accuracy check (2.2.3)
     _log_fused_directions(f"{head_id}+{body_id}", "combined", fused)
@@ -813,15 +1220,32 @@ def process_combined_packet(
     ts = max(int(head_data.get("timestamp", 0)), int(body_data.get("timestamp", 0)))
     latency_ms = round(now_ms - ts, 1) if ts else 0.0
 
+    # Canonical orientation: prefer the body (the ICM-20948 lives there in
+    # the current build), fall back to head when the body packet is missing
+    # or has no IMU. Motion summary is the merged one — a fall detected on
+    # either module bubbles up here.
+    if body_has_imu:
+        combined_imu = _build_imu_response(body_imu, motion)
+        combined_imu["canonical_module"] = "body"
+    elif head_has_imu:
+        combined_imu = _build_imu_response(head_imu, motion)
+        combined_imu["canonical_module"] = "head"
+    else:
+        combined_imu = _build_imu_response(body_imu, motion)  # all-zero defaults
+        combined_imu["canonical_module"] = "none"
+
+    # Per-module sub-blocks always exist so dashboards can address them by
+    # name; the "present" flag inside indicates whether the values are real.
+    combined_imu["body"] = _build_imu_response(body_imu, body_motion)
+    combined_imu["head"] = _build_imu_response(head_imu, head_motion)
+    combined_imu["body_present"] = body_has_imu
+    combined_imu["head_present"] = head_has_imu
+
     return {
         "module":     "combined",
         "hazard":     hazard,
         "motors":     motors,
-        "imu":        {
-            "roll_deg":  head_imu["roll_deg"],
-            "pitch_deg": head_imu["pitch_deg"],
-            "yaw_deg":   head_imu["yaw_deg"],
-        },
+        "imu":        combined_imu,
         "latency_ms": latency_ms,
     }
 

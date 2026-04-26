@@ -43,21 +43,46 @@ Request JSON schema (POST /nav)
 
 Response JSON schema
 ---------------------
-  {
-    "status":     "ok",
-    "device_id":  "esp32_head",
-    "module":     "head",
-    "hazard":     {"level": 3, "label": "WARNING", "alerts": [...]},
-    "motors": [
-        {"motor_id": 0, "direction": "front",      "intensity": 153,
-         "frequency_hz": 10, "pattern": "medium_pulse",
-         "active": true,  "zone": "WARNING",
-         "distance_m": 2.3, "source": "tof"},
-        ...   (8 entries total, one per direction)
-    ],
-    "imu":        {"roll_deg": 2.5, "pitch_deg": -1.2, "yaw_deg": 45.0},
-    "latency_ms": 12.4
-  }
+The `/nav` response is **module-specific** — each ESP32 only receives the
+haptic decision for the channel it owns (design-doc §1.2 / §2.5):
+
+  • HEAD module (hazard headband) – receives the full 8-motor hazard array:
+    {
+      "status":     "ok",
+      "device_id":  "esp32_head",
+      "module":     "head",
+      "hazard":     {"level": 3, "label": "WARNING", "alerts": [...]},
+      "motors": [
+          {"motor_id": 0, "direction": "front",      "intensity": 153,
+           "frequency_hz": 10, "pattern": "medium_pulse",
+           "active": true,  "zone": "WARNING",
+           "distance_m": 2.3, "source": "tof"},
+          ...   (8 entries total, one per direction)
+      ],
+      "imu":        {"roll_deg": 2.5, "pitch_deg": -1.2, "yaw_deg": 45.0},
+      "latency_ms": 12.4
+    }
+
+  • BODY module (navigation belt) – receives the single navigation motor
+    decision pushed by the Phone/PC app via /nav/set_command:
+    {
+      "status":     "ok",
+      "device_id":  "esp32_body",
+      "module":     "body",
+      "server_recv_ms": 1712689423500.0,
+      "hazard":     {"level": 1, "label": "CAUTION", "alerts": [...]},
+      "nav_motor": {
+          "command":     "left",            ← front/right/left/back/... or stop
+          "motor_id":    6,                 ← 0–7 belt index, -1 for stop
+          "intensity":   153,
+          "pattern":     "medium_pulse",
+          "phase":       "execute",         ← "prepare" or "execute"
+          "active":      true,
+          "instruction": "Turn left onto Green St",
+          "distance_m":  45.0,
+          "updated_at":  1712689420.1
+      }
+    }
 
 Logging
 -------
@@ -93,7 +118,14 @@ import os
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
-from algorithm import process_combined_packet, print_decision, fresh_device_state
+from algorithm import (
+    process_combined_packet,
+    print_decision,
+    fresh_device_state,
+    wrap_180,
+    relative_bearing_to_command,
+    expected_turn_angle_deg,
+)
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -505,8 +537,38 @@ def nav() -> tuple:
                     if t.get("interval_count") else None)
     rate_hz = round(1000.0 / avg_interval, 2) if avg_interval else None
 
-    batt   = body_pkt.get("battery") or {}
-    sys_   = body_pkt.get("system")  or {}
+    # Power telemetry: the body module owns the LiPo + fuel gauge, so it is
+    # the preferred source.  When the body hasn't (yet) connected — e.g.
+    # head-only bring-up — fall back to whichever packet has battery data,
+    # so the dashboard still shows live numbers instead of all "—".
+    body_batt = body_pkt.get("battery") or {}
+    body_sys  = body_pkt.get("system")  or {}
+    head_batt = head_pkt.get("battery") or {}
+    head_sys  = head_pkt.get("system")  or {}
+
+    if body_batt or body_sys or body_pkt.get("uptime_ms") is not None:
+        power_src   = "body"
+        power_batt  = body_batt
+        power_sys   = body_sys
+        power_uptime_ms = body_pkt.get("uptime_ms", 0) or 0
+    elif head_batt or head_sys or head_pkt.get("uptime_ms") is not None:
+        power_src   = "head"
+        power_batt  = head_batt
+        power_sys   = head_sys
+        power_uptime_ms = head_pkt.get("uptime_ms", 0) or 0
+    else:
+        power_src   = "none"
+        power_batt  = {}
+        power_sys   = {}
+        power_uptime_ms = 0
+
+    # IMU-aware navigation hook: feed every body IMU sample into the
+    # orientation cache + active-turn tracker. This is what makes
+    # body-frame turn commands and turn-confirmation work.
+    body_imu_payload = body_pkt.get("imu") or {}
+    if body_imu_payload:
+        _ingest_body_imu(body_imu_payload, now_ms / 1000.0)
+
     _latest_sensor_state.update({
         "device_id":   device_id,
         "module":      module,
@@ -516,8 +578,15 @@ def nav() -> tuple:
         "tof_head":    _tof_to_m(head_pkt.get("tof_sensors", {})),
         "mmwave_body": body_pkt.get("mmwave_sensors", {}),
         "mmwave_head": head_pkt.get("mmwave_sensors", {}),
+        # Raw IMU block as the firmware sent it. Empty dict when the module
+        # has no IMU, so the dashboard can render a "(not equipped)" tile.
         "imu_body":    body_pkt.get("imu", {}),
         "imu_head":    head_pkt.get("imu", {}),
+        # IMU-aware navigation state — body orientation cache + active turn.
+        # Repeating it on every /sensor_state poll means the combined
+        # dashboard doesn't need a second /nav/turn_status request.
+        "orientation": dict(body_orientation_state),
+        "turn_status": _turn_status_payload(),
         "fused": {
             m["direction"]: {
                 "dist_m":  m["distance_m"],
@@ -530,12 +599,13 @@ def nav() -> tuple:
         "hazard":      result["hazard"],
         "imu_combined": result["imu"],
         "power": {
-            "voltage_v": batt.get("voltage_v"),
-            "soc_pct":   batt.get("soc_pct"),
-            "temp_c":    sys_.get("die_temp_c"),
-            "heap_b":    sys_.get("free_heap_b"),
-            "rssi":      sys_.get("wifi_rssi"),
-            "uptime_s":  (body_pkt.get("uptime_ms", 0) or 0) / 1000.0,
+            "source":    power_src,                          # "body" | "head" | "none"
+            "voltage_v": power_batt.get("voltage_v"),
+            "soc_pct":   power_batt.get("soc_pct"),
+            "temp_c":    power_sys.get("die_temp_c"),
+            "heap_b":    power_sys.get("free_heap_b"),
+            "rssi":      power_sys.get("wifi_rssi"),
+            "uptime_s":  power_uptime_ms / 1000.0,
         },
         "pkt_rate_hz": rate_hz,
         "proc_ms":     round(proc_ms, 2),
@@ -554,12 +624,53 @@ def nav() -> tuple:
         pkt_count, device_id, new_zone, proc_ms,
     )
 
-    return jsonify({
-        "status":          "ok",
-        "device_id":       device_id,
-        "server_recv_ms":  now_ms,   # ← ESP32: compute RTT as millis()-pkt_ts_sent, latency≈RTT/2
-        **result,
-    })
+    # Channel separation (design doc 1.2 / 2.5):
+    #   • HEAD  module → 8 hazard motor commands (head wears the alert headband)
+    #   • BODY  module → 1 navigation motor command (waist wears the nav belt)
+    # Each module receives ONLY the haptics it owns, plus the shared hazard
+    # summary so both can log the same fused state.
+    if module == "head":
+        return jsonify({
+            "status":         "ok",
+            "device_id":      device_id,
+            "module":         "head",
+            "server_recv_ms": now_ms,   # ← ESP32: compute RTT as millis()-pkt_ts_sent, latency≈RTT/2
+            **result,
+        })
+    else:
+        # Body module: return current navigation motor decision from nav_state
+        # (pushed by the Phone/PC app via /nav/set_command).  The body firmware
+        # drives the belt motor matching nav_motor.motor_id at the given
+        # intensity / pattern.  Hazard summary is still included for logging
+        # but hazard haptics belong to the head module only.
+        nav_motor = {
+            "command":     nav_state["command"],
+            "motor_id":    nav_state["motor_id"],
+            "intensity":   nav_state["intensity"],
+            "pattern":     nav_state["pattern"],
+            "phase":       nav_state["phase"],
+            "active":      nav_state["active"],
+            "instruction": nav_state["instruction"],
+            "distance_m":  nav_state["distance_m"],
+            "updated_at":  nav_state["updated_at"],
+        }
+
+        nav_logger.debug(
+            "│  [NAV:BODY_DELIVER] device=%-14s cmd=%s motor=%d intensity=%d "
+            "pattern=%s active=%s",
+            device_id, nav_motor["command"], nav_motor["motor_id"],
+            nav_motor["intensity"], nav_motor["pattern"], nav_motor["active"],
+        )
+
+        return jsonify({
+            "status":         "ok",
+            "device_id":      device_id,
+            "module":         module,
+            "server_recv_ms": now_ms,
+            "hazard":         result["hazard"],   # hazard summary for body logging
+            "nav_motor":      nav_motor,          # navigation belt motor decision
+            "turn_status":    _turn_status_payload(),  # live turn-confirmation
+        })
 
 
 @app.route("/status", methods=["GET"])
@@ -588,6 +699,160 @@ def sensor_state() -> tuple:
     if not _latest_sensor_state:
         return jsonify({"status": "waiting", "message": "No packets received yet"}), 204
     return jsonify({"status": "ok", **_latest_sensor_state})
+
+
+# ---------------------------------------------------------------------------
+# Per-module snapshot  (drives the head-only and body-only dashboards)
+# ---------------------------------------------------------------------------
+
+_MODULE_OFFLINE_MS = 2000   # treat module as offline after 2s of silence
+
+
+def _tof_dict_to_metres(tof_dict: dict) -> dict:
+    """Convert raw tof_sensors dict → {direction: dist_m | None}.
+
+    Mirrors the same filter used by the combined /sensor_state endpoint:
+    drop sentinel/over-range values (>= 8190 mm or <= 0).
+    """
+    out = {}
+    for d, v in tof_dict.items():
+        if not isinstance(v, dict):
+            out[d] = None
+            continue
+        raw = v.get("avg") or v.get("distance_mm")
+        out[d] = (None if (raw is None or raw >= 8190 or raw <= 0)
+                  else round(raw / 1000.0, 4))
+    return out
+
+
+def _per_module_snapshot(module: str) -> dict | None:
+    """
+    Build a per-module sensor-state snapshot for /sensor_state/<module>.
+
+    Returns ``None`` if no packet has ever been received from that module.
+    The payload is intentionally focused on a single module so the per-module
+    dashboards (head_dashboard.html / body_dashboard.html) can render their
+    page without filtering out the other module's noise.
+    """
+    if module not in ("head", "body"):
+        return None
+
+    pkt = latest_module_data.get(module) or {}
+    if not pkt:
+        return None
+
+    device_id = pkt.get("device_id")
+    if not device_id:
+        # Fall back: scan device_state for any device whose .module matches.
+        for did, st in device_state.items():
+            if st.get("module") == module:
+                device_id = did
+                break
+
+    state = device_state.get(device_id, {}) if device_id else {}
+    t     = _device_timing.get(device_id, {}) if device_id else {}
+    stats = _device_stats.get(device_id, {}) if device_id else {}
+
+    now_ms       = time.time() * 1000.0
+    last_seen_ms = state.get("last_seen_ms", 0) or t.get("last_recv_ms", 0)
+    idle_ms      = (now_ms - last_seen_ms) if last_seen_ms else None
+    online       = idle_ms is not None and idle_ms < _MODULE_OFFLINE_MS
+
+    iv_count = t.get("interval_count", 0)
+    avg_iv   = (t["interval_sum_ms"] / iv_count) if iv_count else None
+    rate_hz  = round(1000.0 / avg_iv, 2) if avg_iv else None
+    min_iv   = t.get("interval_min_ms")
+    max_iv   = t.get("interval_max_ms")
+    if min_iv == float("inf"):
+        min_iv = None
+
+    pt_count = stats.get("proc_time_count", 0)
+    avg_pt   = (stats["proc_time_sum_ms"] / pt_count) if pt_count else None
+    max_pt   = stats.get("proc_time_max_ms", 0.0)
+
+    snap: dict[str, Any] = {
+        "module":           module,
+        "device_id":        device_id,
+        "online":           online,
+        "last_seen_ms":     last_seen_ms or None,
+        "idle_since_ms":    round(idle_ms, 1) if idle_ms is not None else None,
+        "packet_count":     state.get("packet_count", 0),
+        "pkt_rate_hz":      rate_hz,
+        "interval_avg_ms":  round(avg_iv, 2) if avg_iv is not None else None,
+        "interval_min_ms":  round(min_iv, 2) if min_iv is not None else None,
+        "interval_max_ms":  round(max_iv, 2) if max_iv is not None else None,
+        # proc_ms / latency_ms reflect the most recent packet across all
+        # devices, but in practice the module-of-interest is also the most
+        # recent producer at ~10 Hz, so the value tracks closely.
+        "proc_ms":          _latest_sensor_state.get("proc_ms"),
+        "proc_avg_ms":      round(avg_pt, 3) if avg_pt is not None else None,
+        "proc_max_ms":      round(max_pt, 3) if max_pt else None,
+        "latency_ms":       _latest_sensor_state.get("latency_ms"),
+        "uptime_s":         (pkt.get("uptime_ms", 0) or 0) / 1000.0,
+        "tof":              _tof_dict_to_metres(pkt.get("tof_sensors", {})),
+        "tof_raw":          pkt.get("tof_sensors", {}),
+        "mmwave":           pkt.get("mmwave_sensors", {}),
+        "imu":              pkt.get("imu", {}),
+        "battery":          pkt.get("battery", {}),
+        "system":           pkt.get("system", {}),
+        "last_zone":        state.get("last_zone", "CLEAR"),
+        # Shared fused/hazard summary so the per-module page can show what the
+        # algorithm decided after merging with the other module.
+        "hazard":           _latest_sensor_state.get("hazard", {}),
+        "fused":            _latest_sensor_state.get("fused", {}),
+        "hazard_zone_counts": dict(stats.get("hazard_counts", {})),
+        "timestamp":        now_ms,
+    }
+
+    if module == "head":
+        # Head wears the 8-motor hazard ring – expose the server-commanded
+        # set so the page shows exactly what the head ESP32 was told to do.
+        snap["motors"] = _latest_sensor_state.get("motors", [])
+    else:
+        # Body wears the single-motor navigation belt.  Reflect the latest
+        # nav_state so the page shows the active turn cue / instruction.
+        snap["nav_motor"] = {
+            "command":     nav_state["command"],
+            "motor_id":    nav_state["motor_id"],
+            "intensity":   nav_state["intensity"],
+            "pattern":     nav_state["pattern"],
+            "phase":       nav_state["phase"],
+            "active":      nav_state["active"],
+            "instruction": nav_state["instruction"],
+            "distance_m":  nav_state["distance_m"],
+            "updated_at":  nav_state["updated_at"],
+        }
+        # IMU-aware navigation state — body owns the only IMU, so the body
+        # dashboard exposes the orientation cache and live turn confirmation
+        # without an extra /nav/turn_status round-trip.
+        snap["orientation"] = dict(body_orientation_state)
+        snap["turn_status"] = _turn_status_payload()
+
+    return snap
+
+
+@app.route("/sensor_state/<module>", methods=["GET"])
+def sensor_state_module(module: str) -> tuple:
+    """
+    Return the latest sensor snapshot for a single module ("head" | "body").
+
+    Used by the per-module dashboards (head_dashboard.html, body_dashboard.html)
+    so each page can poll only its own module's data without mixing in the
+    other module's sensors.
+    """
+    if module not in ("head", "body"):
+        return jsonify({
+            "status":  "error",
+            "message": f"unknown module '{module}', expected 'head' or 'body'",
+        }), 404
+    snap = _per_module_snapshot(module)
+    if snap is None:
+        return jsonify({
+            "status":  "waiting",
+            "module":  module,
+            "message": f"No packets received from {module} module yet",
+        }), 204
+    return jsonify({"status": "ok", **snap})
 
 
 @app.route("/log_summary", methods=["GET"])
@@ -710,7 +975,253 @@ position_state: dict[str, Any] = {
     "updated_at": 0.0,
 }
 
+# ---------------------------------------------------------------------------
+# Body IMU orientation cache — populated whenever a body /nav packet arrives
+# carrying ICM-20948 data. Used to translate phone-supplied absolute bearings
+# into body-frame haptic commands and to confirm turns.
+# ---------------------------------------------------------------------------
+body_orientation_state: dict[str, Any] = {
+    "yaw_deg":          None,    # tilt-compensated heading (0=N, CW)
+    "gyro_z_dps":       0.0,     # current yaw rate
+    "is_turning":       False,   # firmware classifier
+    "is_falling":       False,
+    "mag_calibrated":   False,
+    "updated_at":       0.0,     # epoch seconds
+}
+
+# Active turn-confirmation state. None when no turn is being tracked.
+# Started by /nav/set_command, advanced by every body /nav packet, cleared by
+# completion / timeout / explicit /nav/stop.
+turn_state: dict[str, Any] = {
+    "active":          False,
+    "command":         "stop",        # body-frame direction issued
+    "expected_deg":    0.0,           # absolute angle the user must turn
+    "signed_target":   0.0,           # signed delta (+CW / -CCW)
+    "start_yaw":       None,          # body yaw at command issue
+    "progress_deg":    0.0,           # accumulated yaw rotation since start
+    "completion_pct":  0.0,           # progress_deg / expected_deg, clamped 0–1
+    "completed":       False,
+    "started_at":      0.0,
+    "updated_at":      0.0,
+    "timeout_s":       30.0,          # auto-give-up window
+    "last_yaw":        None,          # internal: previous yaw sample
+}
+
+# Tolerance: a turn is confirmed when the user has rotated this fraction of
+# the expected angle. 0.85 leaves room for the user not perfectly nailing
+# 90°/180° while still being unambiguous.
+_TURN_COMPLETE_FRACTION = 0.85
+
 nav_logger = logging.getLogger("omnisense.nav")
+
+
+# ---------------------------------------------------------------------------
+# IMU-aware navigation helpers
+# ---------------------------------------------------------------------------
+# These are invoked from the /nav handler (every body packet) and from the
+# /nav/set_command handler (when the phone issues a turn). They turn raw IMU
+# telemetry into:
+#   1. A live yaw cache used to translate phone-supplied compass bearings
+#      into the correct body-frame haptic command.
+#   2. A turn-progress tracker that integrates the user's actual rotation
+#      so the server can confirm the turn happened and auto-advance the
+#      Google-Maps step index.
+# ---------------------------------------------------------------------------
+
+def _ingest_body_imu(imu: dict, now_s: float) -> None:
+    """Update body_orientation_state and advance any active turn from a
+    body-side IMU payload. Called once per /nav body packet.
+
+    Yaw is required; gyro_z is optional (used as a fallback / sanity check).
+    Silently no-ops if no usable yaw is present (e.g. firmware not reporting
+    IMU yet, or the magnetometer is uncalibrated and yaw is None).
+    """
+    yaw = imu.get("yaw_deg")
+    if yaw is None:
+        # No magnetometer fix yet — keep last known yaw, do not advance turn.
+        body_orientation_state["gyro_z_dps"]     = float(imu.get("gyro_z", 0.0) or 0.0)
+        body_orientation_state["is_turning"]     = bool(imu.get("is_turning", False))
+        body_orientation_state["is_falling"]     = bool(imu.get("is_falling", False))
+        body_orientation_state["mag_calibrated"] = bool(imu.get("mag_calibrated", False))
+        body_orientation_state["updated_at"]     = now_s
+        return
+
+    yaw = float(yaw)
+    prev_yaw = body_orientation_state["yaw_deg"]
+
+    body_orientation_state["yaw_deg"]        = yaw
+    body_orientation_state["gyro_z_dps"]     = float(imu.get("gyro_z", 0.0) or 0.0)
+    body_orientation_state["is_turning"]     = bool(imu.get("is_turning", False))
+    body_orientation_state["is_falling"]     = bool(imu.get("is_falling", False))
+    body_orientation_state["mag_calibrated"] = bool(imu.get("mag_calibrated", False))
+    body_orientation_state["updated_at"]     = now_s
+
+    if turn_state["active"] and not turn_state["completed"]:
+        _advance_turn_progress(yaw, prev_yaw, now_s)
+
+
+def _advance_turn_progress(yaw: float, prev_yaw: float | None, now_s: float) -> None:
+    """Integrate yaw rotation into turn_state["progress_deg"]. Each /nav body
+    packet contributes the wrapped delta between the previous and current yaw
+    samples; we accumulate the *signed* delta in the direction of the
+    expected turn.
+
+    When |progress| reaches _TURN_COMPLETE_FRACTION × expected_deg, the turn
+    is marked complete, route_state.step_index is auto-advanced, and the
+    nav command is reset to "front".
+    """
+    expected   = float(turn_state["expected_deg"])
+    sign_target = 1.0 if turn_state["signed_target"] >= 0 else -1.0
+
+    if prev_yaw is None:
+        # First sample after command issue — nothing to integrate yet.
+        turn_state["last_yaw"]   = yaw
+        turn_state["updated_at"] = now_s
+        return
+
+    # Wrapped angle delta in (-180, +180]; positive = clockwise rotation.
+    delta = wrap_180(yaw - (turn_state["last_yaw"] or prev_yaw))
+
+    # Project onto the expected rotation direction so counter-rotation
+    # subtracts. For "front" / "stop" (expected==0) we just measure |progress|
+    # for telemetry purposes but never auto-complete.
+    progress = float(turn_state["progress_deg"]) + delta * sign_target
+    turn_state["progress_deg"] = progress
+    turn_state["last_yaw"]     = yaw
+    turn_state["updated_at"]   = now_s
+
+    if expected > 1e-3:
+        turn_state["completion_pct"] = max(0.0, min(1.0, progress / expected))
+
+    # Auto-confirm the turn once the user has executed _TURN_COMPLETE_FRACTION
+    # of the requested angle. We require progress in the *correct* direction
+    # to count, hence the ≥ check (not abs) — pivoting the wrong way will
+    # never satisfy this.
+    if expected > 1e-3 and progress >= expected * _TURN_COMPLETE_FRACTION:
+        _on_turn_completed(now_s)
+        return
+
+    # Timeout: if the user hasn't executed the turn within turn_state.timeout_s
+    # we leave nav_state alone (the belt keeps buzzing) but mark the turn
+    # inactive so the phone can show a nudge / re-issue.
+    if (now_s - turn_state["started_at"]) > float(turn_state["timeout_s"]):
+        turn_state["active"]    = False
+        turn_state["completed"] = False
+        nav_logger.warning(
+            "[NAV:TURN_TIMEOUT] command=%s expected=%.0f° progress=%.0f° "
+            "elapsed=%.1fs — user did not complete the turn in time",
+            turn_state["command"], expected, progress,
+            now_s - turn_state["started_at"],
+        )
+
+
+def _on_turn_completed(now_s: float) -> None:
+    """Mark the active turn complete, advance the route step, and reset the
+    belt motor to "front" (straight). The phone will pick up the new
+    instruction on its next /nav/route_status poll, or via /nav/turn_status.
+    """
+    turn_state["active"]     = False
+    turn_state["completed"]  = True
+    turn_state["updated_at"] = now_s
+
+    if route_state.get("active") and route_state.get("steps"):
+        route_state["step_index"] = min(
+            int(route_state["step_index"]) + 1,
+            max(0, len(route_state["steps"]) - 1),
+        )
+        route_state["updated_at"] = time.time()
+
+    nav_logger.info(
+        "[NAV:TURN_DONE] command=%s expected=%.0f° actual=%.0f° "
+        "step_index→%d",
+        turn_state["command"], turn_state["expected_deg"],
+        turn_state["progress_deg"], route_state.get("step_index", 0),
+    )
+
+    # Reset the haptic command to straight-ahead; phone pushes the next turn
+    # via /nav/set_command when the user nears the next step.
+    nav_state.update({
+        "command":     "front",
+        "motor_id":    _NAV_MOTOR_MAP["front"],
+        "intensity":   _NAV_INTENSITY["front"],
+        "pattern":     _NAV_PATTERN["front"],
+        "instruction": "Turn complete — continue straight",
+        "phase":       "execute",
+        "active":      True,
+        "updated_at":  time.time(),
+    })
+
+
+def _start_turn_tracking(command: str) -> None:
+    """Snapshot the body yaw at the moment a turn command is issued.
+
+    No-op for non-turn commands (front / stop). For valid turn commands we
+    seed turn_state with the expected angle and direction so subsequent /nav
+    body packets can integrate progress.
+    """
+    expected_abs    = expected_turn_angle_deg(command)
+    signed_target   = 0.0 if command == "front" else (
+        180.0 if command == "back" else
+        # _COMMAND_DELTA_DEG isn't exported, but we re-derive the sign from the
+        # command name — *_right is positive (CW), *_left is negative (CCW).
+        +expected_abs if command.endswith("right") else -expected_abs
+    )
+
+    if expected_abs < 1e-3 or command in ("front", "stop"):
+        # Reset / no tracking needed.
+        turn_state.update({
+            "active":         False,
+            "command":        command,
+            "expected_deg":   0.0,
+            "signed_target":  0.0,
+            "start_yaw":      body_orientation_state.get("yaw_deg"),
+            "progress_deg":   0.0,
+            "completion_pct": 0.0,
+            "completed":      command == "stop",
+            "started_at":     time.time(),
+            "updated_at":     time.time(),
+            "last_yaw":       body_orientation_state.get("yaw_deg"),
+        })
+        return
+
+    turn_state.update({
+        "active":         True,
+        "command":        command,
+        "expected_deg":   expected_abs,
+        "signed_target":  signed_target,
+        "start_yaw":      body_orientation_state.get("yaw_deg"),
+        "progress_deg":   0.0,
+        "completion_pct": 0.0,
+        "completed":      False,
+        "started_at":     time.time(),
+        "updated_at":     time.time(),
+        "last_yaw":       body_orientation_state.get("yaw_deg"),
+    })
+
+    nav_logger.info(
+        "[NAV:TURN_START] command=%s expected=%.0f° start_yaw=%s",
+        command, expected_abs,
+        f"{turn_state['start_yaw']:.1f}°" if turn_state["start_yaw"] is not None else "?",
+    )
+
+
+def _turn_status_payload() -> dict:
+    """Compact, JSON-safe view of turn_state for HTTP responses."""
+    return {
+        "active":         bool(turn_state["active"]),
+        "completed":      bool(turn_state["completed"]),
+        "command":        turn_state["command"],
+        "expected_deg":   round(float(turn_state["expected_deg"]), 1),
+        "progress_deg":   round(float(turn_state["progress_deg"]), 1),
+        "completion_pct": round(float(turn_state["completion_pct"]), 3),
+        "start_yaw":      (None if turn_state["start_yaw"] is None
+                           else round(float(turn_state["start_yaw"]), 1)),
+        "current_yaw":    (None if body_orientation_state["yaw_deg"] is None
+                           else round(float(body_orientation_state["yaw_deg"]), 1)),
+        "elapsed_s":      round(max(0.0, time.time() - float(turn_state["started_at"])), 2),
+        "timeout_s":      float(turn_state["timeout_s"]),
+        "mag_calibrated": bool(body_orientation_state["mag_calibrated"]),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -723,22 +1234,82 @@ def nav_set_command():
     Phone/PC app pushes the resolved navigation motor command.
     The body ESP32 will poll /nav/get_command to receive it.
 
-    Body::
+    Two ways to specify the direction (in priority order):
 
-        {
-          "command":     "left",          <- front/right/left/back/... or stop
-          "motor_id":    6,
-          "intensity":   153,
-          "pattern":     "medium_pulse",
-          "instruction": "Turn left onto Green St",
-          "distance_m":  45.0,
-          "phase":       "execute"        <- "prepare" or "execute"
-        }
+    1.  IMU-aware (preferred) — supply the *absolute* compass bearing the
+        user must travel. The server reads the latest body IMU yaw and
+        translates the bearing into the right body-frame command.
+
+            {
+              "target_bearing_deg": 90.0,        # 0=N, 90=E, 180=S, 270=W
+              "instruction": "Turn right onto Wright St",
+              "distance_m":  45.0,
+              "phase":       "execute"
+            }
+
+    2.  Direct command — caller already knows which belt motor to fire
+        (legacy / manual control):
+
+            {
+              "command":     "left",             # front/right/left/back/...
+              "motor_id":    6,
+              "intensity":   153,
+              "pattern":     "medium_pulse",
+              "instruction": "Turn left onto Green St",
+              "distance_m":  45.0,
+              "phase":       "execute"
+            }
+
+    Whenever a turn command (anything but front/stop) is issued, the server
+    snapshots the current body yaw and starts a turn-confirmation tracker.
+    Subsequent body /nav packets advance the tracker; once the user has
+    rotated ~85% of the expected angle the route step auto-advances and the
+    belt drops back to "front".
     """
     data = request.get_json(silent=True) or {}
-    command = str(data.get("command", "stop")).lower()
-    if command not in _NAV_DIRECTIONS:
-        command = "stop"
+
+    target_bearing = data.get("target_bearing_deg")
+    resolved_via_imu = False
+    delta_deg: float | None = None
+
+    if target_bearing is not None:
+        # IMU-aware path: rotate the world bearing into the user body frame.
+        try:
+            target_bearing = float(target_bearing)
+        except (TypeError, ValueError):
+            return jsonify({
+                "status":  "error",
+                "message": "target_bearing_deg must be a number (0–360)",
+            }), 400
+
+        user_yaw = body_orientation_state.get("yaw_deg")
+        if user_yaw is None:
+            # No yaw fix yet — the firmware hasn't sent IMU data, or the
+            # magnetometer is uncalibrated. Fall back to the phone's own
+            # heading if it pushed one via /nav/position.
+            user_yaw = position_state.get("heading")
+
+        if user_yaw is None:
+            return jsonify({
+                "status":  "error",
+                "message": ("no body yaw available yet — calibrate the IMU "
+                            "or POST /nav/position first"),
+            }), 409
+
+        command, delta_deg = relative_bearing_to_command(
+            target_bearing, float(user_yaw)
+        )
+        resolved_via_imu = True
+
+        nav_logger.info(
+            "[NAV:RESOLVE_BEARING] target=%.1f° yaw=%.1f° → command=%s "
+            "delta=%+.1f°",
+            target_bearing, float(user_yaw), command, delta_deg,
+        )
+    else:
+        command = str(data.get("command", "stop")).lower()
+        if command not in _NAV_DIRECTIONS:
+            command = "stop"
 
     nav_state["command"]     = command
     nav_state["motor_id"]    = _NAV_MOTOR_MAP[command]
@@ -750,12 +1321,24 @@ def nav_set_command():
     nav_state["active"]      = command != "stop"
     nav_state["updated_at"]  = time.time()
 
+    # Kick off / reset turn confirmation. For "front"/"stop" this just clears
+    # any stale tracker; for an actual turn it snapshots the start yaw.
+    _start_turn_tracking(command)
+
     nav_logger.info(
-        "[NAV:COMMAND] cmd=%s motor=%d intensity=%d dist=%s phase=%s instr=%r",
+        "[NAV:COMMAND] cmd=%s motor=%d intensity=%d dist=%s phase=%s instr=%r%s",
         command, nav_state["motor_id"], nav_state["intensity"],
         nav_state["distance_m"], nav_state["phase"], nav_state["instruction"],
+        f" (resolved_via_imu, delta={delta_deg:+.1f}°)" if resolved_via_imu else "",
     )
-    return jsonify({"status": "ok", **nav_state})
+
+    return jsonify({
+        "status":           "ok",
+        "resolved_via_imu": resolved_via_imu,
+        "delta_deg":        (None if delta_deg is None else round(delta_deg, 1)),
+        "turn":             _turn_status_payload(),
+        **nav_state,
+    })
 
 
 @app.route("/nav/get_command", methods=["GET"])
@@ -822,6 +1405,47 @@ def nav_route_status():
     return jsonify({"status": "ok", "route": route_state, "nav": nav_state})
 
 
+@app.route("/nav/turn_status", methods=["GET"])
+def nav_turn_status():
+    """
+    Phone polls this endpoint to know whether the user has executed the
+    most recently issued turn (for auto-advancing the on-screen route step
+    and for re-prompting if the user is hesitating).
+
+    Response::
+
+        {
+          "status": "ok",
+          "turn": {
+            "active":         true,        # turn currently being tracked
+            "completed":      false,       # user has rotated through the angle
+            "command":        "left",
+            "expected_deg":    90.0,
+            "progress_deg":    62.4,       # signed; ≥ expected*0.85 = done
+            "completion_pct":  0.69,
+            "start_yaw":     180.0,
+            "current_yaw":   118.4,
+            "elapsed_s":       3.2,
+            "timeout_s":      30.0,
+            "mag_calibrated": true
+          },
+          "orientation": {
+            "yaw_deg":       118.4,
+            "gyro_z_dps":   -27.5,
+            "is_turning":    true,
+            "is_falling":    false,
+            "mag_calibrated": true,
+            "updated_at":   1712689424.1
+          }
+        }
+    """
+    return jsonify({
+        "status":      "ok",
+        "turn":        _turn_status_payload(),
+        "orientation": dict(body_orientation_state),
+    })
+
+
 @app.route("/nav/position", methods=["POST"])
 def nav_position():
     """
@@ -849,6 +1473,8 @@ def nav_stop():
     })
     route_state["active"]    = False
     route_state["updated_at"] = time.time()
+    # Clear any in-flight turn tracking so the next nav session starts clean.
+    _start_turn_tracking("stop")
     nav_logger.info("[NAV:STOP] navigation stopped by app")
     return jsonify({"status": "ok"})
 
@@ -858,8 +1484,28 @@ _FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "frontend")
 
 @app.route("/dashboard")
 def dashboard():
-    """Serve the sensor dashboard UI directly from the Flask server."""
+    """Serve the combined (head + body) sensor dashboard UI."""
     return send_from_directory(_FRONTEND_DIR, "sensor_dashboard.html")
+
+
+@app.route("/dashboard/head")
+def dashboard_head():
+    """Serve the head-only dashboard.
+
+    Polls /sensor_state/head and renders the 8-motor hazard ring along
+    with head-side ToF / mmWave / IMU / battery telemetry.
+    """
+    return send_from_directory(_FRONTEND_DIR, "head_dashboard.html")
+
+
+@app.route("/dashboard/body")
+def dashboard_body():
+    """Serve the body-only dashboard.
+
+    Polls /sensor_state/body and renders the navigation belt motor along
+    with body-side ToF / mmWave / IMU / battery telemetry.
+    """
+    return send_from_directory(_FRONTEND_DIR, "body_dashboard.html")
 
 
 @app.route("/frontend/<path:filename>")

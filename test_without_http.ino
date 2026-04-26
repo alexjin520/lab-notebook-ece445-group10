@@ -2,6 +2,7 @@
 #include "driver/temperature_sensor.h"   // ESP32-S3 internal temp sensor
 #include <Adafruit_VL53L1X.h>    // VL53L1X 4m ToF distance sensor
 #include <Adafruit_DRV2605.h>    // DRV2605L haptic motor driver
+#include "ICM_20948.h"           // SparkFun ICM-20948 9-DoF IMU (Accel/Gyro/Mag)
 
 // ── Pin definitions (matches schematic I2C0 bus) ─────────────────────────────
 #define I2C_SDA       7
@@ -11,6 +12,40 @@
 // ── TCA9548A I2C Multiplexer ──────────────────────────────────────────────────
 #define MUX_ADDR      0x77   // ToF MUX: A0/A1/A2 all tied to 3.3V → 0x77
 #define DRV_MUX_ADDR  0x70   // DRV MUX: A0/A1/A2 all GND → 0x70
+
+// ── ICM-20948 9-DoF IMU (SparkFun breakout, J_IMU_Back_Up1) ──────────────────
+// Wired on the I2C0 bus (SDA=GPIO7, SCL=GPIO8). AD0 pin tied to GND → addr 0x68.
+// Pins 8-11 (ACL/ADA/FSNC/INT) are unused for basic 9-DoF I2C operation.
+#define IMU_ADDR      0x68   // ICM-20948 (AD0=0); WHO_AM_I should report 0xEA
+static ICM_20948_I2C imuDev;
+static bool          imuPresent = false;
+static uint32_t      imuReadCount = 0;
+static uint32_t      imuErrCount  = 0;
+
+// ── Magnetometer hard-iron offsets (uT) ──────────────────────────────────────
+// Replace these with the values printed at the end of runMagCalibration().
+// Until calibrated, the heading will be biased — direction trends still work.
+static float magOffX = 0.0f;
+static float magOffY = 0.0f;
+static float magOffZ = 0.0f;
+
+// Set to 1 to run a 20-second magnetometer calibration sweep at boot:
+// rotate the head/board slowly through ALL orientations during the sweep.
+// At the end the sketch prints the offsets — paste them above and rebuild.
+#define IMU_MAG_CALIBRATE_AT_BOOT 0
+
+// ── Computed orientation (filled by computeIMUOrientation) ────────────────────
+struct IMUOrient {
+  float roll_deg;     // rotation about body X (forward) — positive = right-side down
+  float pitch_deg;    // rotation about body Y (right)   — positive = nose up
+  float heading_deg;  // tilt-compensated yaw (0 = magnetic North, CW positive)
+  float accel_g;      // |accel| in g  (≈1.0 when stationary)
+  float gyro_dps;     // |gyro|  in deg/s
+  bool  isStill;      // accel ≈ 1g AND gyro nearly zero
+  bool  isTurning;    // |gyro_z| above threshold (yaw rotation)
+  bool  isFalling;    // |accel| ≪ 1g (free-fall window)
+};
+static IMUOrient imuOrient = { 0,0,0, 1.0f, 0, true, false, false };
 
 // ── C4001 24 GHz mmWave Radar ────────────────────────────────────────────────
 // Two Seeed C4001 sensors; each has a UART interface + a digital OUT pin.
@@ -212,13 +247,13 @@ static Adafruit_VL53L1X tofDev[8];
 //                  name          mux_ch  xshut  present  last   cnt    min    max  sum  err
 // XSHUT pin assignments — avoid strapping pins GPIO45 (VDD_SPI sel) and GPIO46 (ROM log)
 static TofSensor tofs[8] = {
-  { "front",           0,   19,   false,   -1,    0,  32767,    0,   0,   0 },  // F   GPIO19  (schematic: XSHUT_F)
+  { "front",           0,   11,   false,   -1,    0,  32767,    0,   0,   0 },  // F   GPIO19  (schematic: XSHUT_F)
   { "front_right",     5,   46,   false,   -1,    0,  32767,    0,   0,   0 },  // FR  GPIO46  (schematic: XSHUT_FR — moved; GPIO16 now RADAR_OUT_2)
-  { "right",           1,   38,   false,   -1,    0,  32767,    0,   0,   0 },  // R   GPIO38
-  { "back_right",      7,   25,   false,   -1,    0,  32767,    0,   0,   0 },  // BR  GPIO25  (schematic: XSHUT_BR)
-  { "back",            2,   21,   false,   -1,    0,  32767,    0,   0,   0 },  // B   GPIO21  (schematic: XSHUT_B)
-  { "back_left",       6,   24,   false,   -1,    0,  32767,    0,   0,   0 },  // BL  GPIO24  (schematic: XSHUT_BL)
-  { "left",            3,   22,   false,   -1,    0,  32767,    0,   0,   0 },  // L   GPIO22  (schematic: XSHUT_L)
+  { "right",           1,   12,   false,   -1,    0,  32767,    0,   0,   0 },  // R   GPIO38
+  { "back_right",      7,   48,   false,   -1,    0,  32767,    0,   0,   0 },  // BR  GPIO25  (schematic: XSHUT_BR)
+  { "back",            2,   13,   false,   -1,    0,  32767,    0,   0,   0 },  // B   GPIO21  (schematic: XSHUT_B)
+  { "back_left",       6,   47,   false,   -1,    0,  32767,    0,   0,   0 },  // BL  GPIO24  (schematic: XSHUT_BL)
+  { "left",            3,   14,   false,   -1,    0,  32767,    0,   0,   0 },  // L   GPIO22  (schematic: XSHUT_L)
   { "front_left",      4,    3,   false,   -1,    0,  32767,    0,   0,   0 },  // FL  GPIO3   (schematic: XSHUT_FL)
 };
 
@@ -500,6 +535,249 @@ static float readTempC() {
   return t;
 }
 
+// ── ICM-20948 IMU initialisation ─────────────────────────────────────────────
+// ad0 = 0 because schematic ties AD0 → GND (address 0x68).
+// Default ranges set: accel ±2g, gyro ±250 dps, magnetometer continuous 100 Hz.
+static bool initIMU() {
+  // Quick I2C ACK probe — fail fast if the breakout isn't wired/powered
+  Wire.beginTransmission(IMU_ADDR);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("  [FAIL] ICM-20948 not ACK at 0x68");
+    Serial.println("    → Check: VCC→3V3 (pin 2/7), GND (pin 1/12), SDA→GPIO7 (pin 3),");
+    Serial.println("             SCL→GPIO8 (pin 4), AD0→GND (pin 5)");
+    return false;
+  }
+  Serial.println("  [PASS] ICM-20948 ACK at 0x68");
+
+  // begin(): bool ad0val=false → AD0=0 (0x68). Library calls Wire.begin() if needed.
+  imuDev.begin(Wire, 0);
+
+  if (imuDev.status != ICM_20948_Stat_Ok) {
+    Serial.print("  [FAIL] ICM-20948 begin() returned: ");
+    Serial.println(imuDev.statusString());
+    return false;
+  }
+
+  // Software reset for a clean state, then re-init
+  imuDev.swReset();
+  delay(50);
+  imuDev.sleep(false);
+  imuDev.lowPower(false);
+
+  // Sample-mode: continuous (vs. polled) for accel + gyro
+  if (imuDev.setSampleMode((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr),
+                           ICM_20948_Sample_Mode_Continuous) != ICM_20948_Stat_Ok) {
+    Serial.print("  [WARN] setSampleMode: "); Serial.println(imuDev.statusString());
+  }
+
+  // Full-scale ranges (defaults are reasonable)
+  ICM_20948_fss_t fss;
+  fss.a = gpm2;     // ±2 g
+  fss.g = dps250;   // ±250 dps
+  if (imuDev.setFullScale((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), fss)
+        != ICM_20948_Stat_Ok) {
+    Serial.print("  [WARN] setFullScale: "); Serial.println(imuDev.statusString());
+  }
+
+  // Bring up the on-chip AK09916 magnetometer (continuous 100 Hz)
+  if (imuDev.startupMagnetometer() != ICM_20948_Stat_Ok) {
+    Serial.print("  [WARN] Magnetometer startup: ");
+    Serial.println(imuDev.statusString());
+    Serial.println("         (Accel + Gyro will still work.)");
+  } else {
+    Serial.println("  [PASS] AK09916 magnetometer online");
+  }
+
+  return true;
+}
+
+// Compass direction (cardinal/intercardinal) for a 0–360° heading
+static const char* headingCardinal(float deg) {
+  if (deg < 0)   deg += 360.0f;
+  if (deg >= 360) deg -= 360.0f;
+  static const char* dirs[8] = {"N","NE","E","SE","S","SW","W","NW"};
+  return dirs[(int)((deg + 22.5f) / 45.0f) & 0x07];
+}
+
+// Derive roll/pitch (from gravity), tilt-compensated heading (from compass),
+// and motion-state booleans. Assumes imuDev.getAGMT() was called recently.
+//
+// Convention used here (matches the SparkFun ICM-20948 default body axes):
+//   +X = forward, +Y = right, +Z = down
+//   roll  = rotation about X (right-side dipping → +)
+//   pitch = rotation about Y (nose up → +)
+//   yaw   = rotation about Z (clockwise from above → +)
+//
+// If your IMU is mounted with a different orientation on the head, just
+// swap/negate axis reads below — that's the only place that needs to know.
+static void computeIMUOrientation() {
+  if (!imuPresent) return;
+
+  // Raw scaled values (mg, dps, uT). Hard-iron offsets applied to mag.
+  float ax = imuDev.accX();
+  float ay = imuDev.accY();
+  float az = imuDev.accZ();
+  float gx = imuDev.gyrX();
+  float gy = imuDev.gyrY();
+  float gz = imuDev.gyrZ();
+  float mx = imuDev.magX() - magOffX;
+  float my = imuDev.magY() - magOffY;
+  float mz = imuDev.magZ() - magOffZ;
+
+  // Roll & pitch from gravity. Valid whenever linear acceleration ≪ g
+  // (i.e. user is not in the middle of a sudden lurch).
+  float roll  = atan2f(ay, az);
+  float pitch = atan2f(-ax, sqrtf(ay * ay + az * az));
+
+  // Tilt-compensate the magnetometer: rotate the (mx,my,mz) vector
+  // back into the horizontal plane using the roll/pitch we just derived.
+  float cR = cosf(roll),  sR = sinf(roll);
+  float cP = cosf(pitch), sP = sinf(pitch);
+  float mxh =  mx * cP + my * sR * sP + mz * cR * sP;
+  float myh =             my * cR     - mz * sR;
+
+  // atan2 with the chosen sign convention so 0° = magnetic North,
+  // increasing clockwise (i.e. East = 90°, South = 180°, West = 270°).
+  float yaw = atan2f(-myh, mxh);
+  if (yaw < 0) yaw += 2.0f * (float)PI;
+
+  imuOrient.roll_deg    = roll  * 180.0f / (float)PI;
+  imuOrient.pitch_deg   = pitch * 180.0f / (float)PI;
+  imuOrient.heading_deg = yaw   * 180.0f / (float)PI;
+
+  imuOrient.accel_g  = sqrtf(ax * ax + ay * ay + az * az) / 1000.0f;
+  imuOrient.gyro_dps = sqrtf(gx * gx + gy * gy + gz * gz);
+
+  // Motion classifiers — tweak thresholds to taste
+  imuOrient.isStill   = (fabsf(imuOrient.accel_g - 1.0f) < 0.05f) &&
+                        (imuOrient.gyro_dps < 5.0f);
+  imuOrient.isTurning = (fabsf(gz) > 30.0f);                 // yaw rate > 30°/s
+  imuOrient.isFalling = (imuOrient.accel_g < 0.4f);          // free-fall window
+}
+
+// One-time magnetometer hard-iron calibration. Collects min/max of each axis
+// while the user rotates the head/board through every orientation, then
+// prints the offsets (average of min+max) for pasting into the constants
+// at the top of this file. Called from setup() when IMU_MAG_CALIBRATE_AT_BOOT=1.
+static void runMagCalibration(uint16_t durationMs = 20000) {
+  if (!imuPresent) return;
+
+  Serial.println();
+  Serial.println("=== Magnetometer Calibration ===");
+  Serial.print("  Slowly rotate the device through ALL orientations for ");
+  Serial.print(durationMs / 1000); Serial.println(" seconds.");
+  Serial.println("  Aim for figure-8 / tumble motion covering every axis.");
+  Serial.println();
+
+  float mxMin =  1e9f, myMin =  1e9f, mzMin =  1e9f;
+  float mxMax = -1e9f, myMax = -1e9f, mzMax = -1e9f;
+  uint32_t samples = 0;
+
+  uint32_t start = millis();
+  uint32_t lastTick = start;
+  while (millis() - start < durationMs) {
+    if (imuDev.dataReady()) {
+      imuDev.getAGMT();
+      if (imuDev.status == ICM_20948_Stat_Ok) {
+        float mx = imuDev.magX(), my = imuDev.magY(), mz = imuDev.magZ();
+        if (mx < mxMin) mxMin = mx;  if (mx > mxMax) mxMax = mx;
+        if (my < myMin) myMin = my;  if (my > myMax) myMax = my;
+        if (mz < mzMin) mzMin = mz;  if (mz > mzMax) mzMax = mz;
+        samples++;
+      }
+    }
+    // Tick once per second so the user can pace their rotation
+    if (millis() - lastTick >= 1000) {
+      lastTick = millis();
+      Serial.print("  t="); Serial.print((millis() - start) / 1000);
+      Serial.print("s  samples="); Serial.print(samples);
+      Serial.print("  X[");  Serial.print(mxMin, 1); Serial.print(",");
+      Serial.print(mxMax, 1); Serial.print("]  Y[");
+      Serial.print(myMin, 1); Serial.print(","); Serial.print(myMax, 1);
+      Serial.print("]  Z["); Serial.print(mzMin, 1); Serial.print(",");
+      Serial.print(mzMax, 1); Serial.println("]");
+    }
+    delay(10);
+  }
+
+  float offX = (mxMax + mxMin) * 0.5f;
+  float offY = (myMax + myMin) * 0.5f;
+  float offZ = (mzMax + mzMin) * 0.5f;
+
+  Serial.println();
+  Serial.println("=== Calibration complete — paste these into the source ===");
+  Serial.print("  static float magOffX = "); Serial.print(offX, 2); Serial.println("f;");
+  Serial.print("  static float magOffY = "); Serial.print(offY, 2); Serial.println("f;");
+  Serial.print("  static float magOffZ = "); Serial.print(offZ, 2); Serial.println("f;");
+  Serial.println();
+
+  // Apply now too so this session uses them immediately
+  magOffX = offX;
+  magOffY = offY;
+  magOffZ = offZ;
+}
+
+// Read latest scaled IMU data, derive navigation values, and print a
+// human-readable summary line.
+static void printIMUReadings() {
+  if (!imuPresent) {
+    Serial.println("[IMU]  not present");
+    return;
+  }
+  if (!imuDev.dataReady()) {
+    Serial.print("[IMU]  no new data  reads:");
+    Serial.print(imuReadCount); Serial.print(" errs:"); Serial.println(imuErrCount);
+    return;
+  }
+
+  imuDev.getAGMT();   // refreshes accel/gyro/mag/temp scaled values
+
+  if (imuDev.status != ICM_20948_Stat_Ok) {
+    imuErrCount++;
+    Serial.print("[IMU]  read error: ");
+    Serial.println(imuDev.statusString());
+    return;
+  }
+  imuReadCount++;
+  computeIMUOrientation();
+
+  // Raw line — milli-g, dps, uT, °C
+  Serial.print("[IMU]  A[mg]=");
+  Serial.print(imuDev.accX(), 0); Serial.print(",");
+  Serial.print(imuDev.accY(), 0); Serial.print(",");
+  Serial.print(imuDev.accZ(), 0);
+  Serial.print("  G[dps]=");
+  Serial.print(imuDev.gyrX(), 1); Serial.print(",");
+  Serial.print(imuDev.gyrY(), 1); Serial.print(",");
+  Serial.print(imuDev.gyrZ(), 1);
+  Serial.print("  M[uT]=");
+  Serial.print(imuDev.magX(), 1); Serial.print(",");
+  Serial.print(imuDev.magY(), 1); Serial.print(",");
+  Serial.print(imuDev.magZ(), 1);
+  Serial.print("  T[C]=");
+  Serial.print(imuDev.temp(), 1);
+  Serial.print("  reads:"); Serial.print(imuReadCount);
+  if (imuErrCount) { Serial.print(" errs:"); Serial.print(imuErrCount); }
+  Serial.println();
+
+  // Derived navigation line — orientation + motion state
+  Serial.print("[NAV]  roll=");  Serial.print(imuOrient.roll_deg, 1);
+  Serial.print("°  pitch=");      Serial.print(imuOrient.pitch_deg, 1);
+  Serial.print("°  hdg=");        Serial.print(imuOrient.heading_deg, 1);
+  Serial.print("° (");            Serial.print(headingCardinal(imuOrient.heading_deg));
+  Serial.print(")  |a|=");        Serial.print(imuOrient.accel_g, 2);
+  Serial.print("g  |w|=");        Serial.print(imuOrient.gyro_dps, 1);
+  Serial.print("°/s  state=");
+  if (imuOrient.isFalling)      Serial.print("FALLING!");
+  else if (imuOrient.isTurning) Serial.print("turning");
+  else if (imuOrient.isStill)   Serial.print("still");
+  else                          Serial.print("moving");
+  // Hint when calibration hasn't been done yet
+  if (magOffX == 0.0f && magOffY == 0.0f && magOffZ == 0.0f)
+    Serial.print("  (mag uncalibrated)");
+  Serial.println();
+}
+
 
 // ═════════════════════════════════════════════════════════════════════════════
 void setup() {
@@ -585,6 +863,7 @@ void setup() {
   Serial.println("  Scanning I2C addresses 0x08–0x77 ...");
   uint8_t devCount = 0;
   bool foundFuelGauge = false;
+  bool foundIMU = false;
 
   for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
     Wire.beginTransmission(addr);
@@ -599,7 +878,8 @@ void setup() {
         case 0x29: Serial.print("VL53L1X ToF (default addr)");    break;
         case 0x30: Serial.print("VL53L1X ToF (reassigned)");      break;
         case 0x5A: Serial.print("DRV2605L Haptic Driver");        break;
-        case 0x68: Serial.print("MPU-6050 / DS3231 RTC");         break;
+        case 0x68: Serial.print("ICM-20948 9-DoF IMU (AD0=GND)"); foundIMU = true; break;
+        case 0x69: Serial.print("ICM-20948 9-DoF IMU (AD0=VCC)"); foundIMU = true; break;
         default:   Serial.print("Unknown device");                break;
       }
       Serial.println();
@@ -714,26 +994,8 @@ void setup() {
   Serial.println("  NOTE: Motors initialised but RTP kept at 0 (silent) — haptic update disabled.");
   initDrvMotors();
 
-  // Per-motor sequential buzz test — each motor individually at RTP=64 for 500ms
-  Serial.println("  Motor connection test: buzzing each motor individually at RTP=64 for 500ms...");
-  for (uint8_t i = 0; i < 8; i++) {
-    Serial.print("    Testing "); Serial.print(drvs[i].dir);
-    Serial.print(" (MUX ch "); Serial.print(drvs[i].mux_ch); Serial.print("): ");
-    if (!drvs[i].present) {
-      Serial.println("SKIP (not detected)");
-      continue;
-    }
-    muxSelectDrv(drvs[i].mux_ch);
-    delayMicroseconds(500);
-    drvDev[i].setRealtimeValue(64);
-    Serial.println("BUZZING...");
-    delay(5000);
-    drvDev[i].setRealtimeValue(0);
-    drvs[i].rtp = 0;
-    muxSelectDrv(0xFF);
-    delay(100);   // brief gap between motors so you can feel the difference
-  }
-  Serial.println("  Motor test complete — all motors silenced.");
+  // Motor buzz test DISABLED
+  Serial.println("  Motor buzz test disabled.");
   Serial.println();
 
   // ── TEST 10: C4001 24 GHz mmWave Radar Sensors ────────────────────────────
@@ -745,6 +1007,36 @@ void setup() {
     Serial.print("    "); Serial.print(radars[i].name);
     Serial.print(" OUT pin → ");
     Serial.println(radars[i].presence ? "PRESENCE DETECTED" : "no presence");
+  }
+  Serial.println();
+
+  // ── TEST 11: ICM-20948 9-DoF IMU (J_IMU_Back_Up1) ─────────────────────────
+  Serial.println("[TEST 11] ICM-20948 9-DoF IMU @ 0x68 (I2C0 bus, AD0=GND)");
+  if (!foundIMU) {
+    printFail("ICM-20948 not seen during I2C scan — skipping init");
+    Serial.println("  Check: 3V3 (J_IMU pin 2/7), GND (pin 1/12),");
+    Serial.println("         SDA→GPIO7 (pin 3), SCL→GPIO8 (pin 4), AD0→GND (pin 5)");
+    recordResult("ICM-20948 IMU", false, "not on bus");
+  } else {
+    imuPresent = initIMU();
+    if (imuPresent) {
+      printPass("ICM-20948 initialised (Accel + Gyro + Mag online)");
+#if IMU_MAG_CALIBRATE_AT_BOOT
+      // Optional one-time hard-iron calibration. Set
+      // IMU_MAG_CALIBRATE_AT_BOOT 1 at the top of the file, upload, rotate
+      // the device through ALL orientations during the sweep, then paste
+      // the printed offsets back into magOffX/Y/Z and rebuild with the
+      // flag back to 0 for normal operation.
+      runMagCalibration(20000);
+#endif
+      // Take one immediate reading so the user sees live values right away
+      delay(20);
+      printIMUReadings();
+      recordResult("ICM-20948 IMU", true, "9-DoF online");
+    } else {
+      printFail("ICM-20948 init failed");
+      recordResult("ICM-20948 IMU", false, "init error");
+    }
   }
   Serial.println();
 
@@ -851,4 +1143,7 @@ void loop() {
     }
     Serial.println();
   }
+
+  // ── ICM-20948 9-DoF IMU: accel/gyro/mag/temp ─────────────────────────────
+  printIMUReadings();
 }

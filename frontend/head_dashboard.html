@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>OmniSense · Head Module Monitor</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d1117;--panel:#161b27;--el:#1e2435;--hover:#252c3d;
+  --accent:#4f8ef7;--accent-head:#e6a817;
+  --danger:#e05c5c;--warn:#e6a817;--ok:#3dba6e;--muted:#7a88a4;
+  --text:#e8ecf4;--border:#252c3d;--borderl:#2e3650;
+  --c-CRITICAL:#e05c5c;--c-DANGER:#e07c3c;--c-WARNING:#e6a817;
+  --c-CAUTION:#4f8ef7;--c-ALERT:#3dba6e;--c-CLEAR:#2e3650;
+}
+html,body{height:100%;background:var(--bg);color:var(--text);
+  font:13px/1.5 system-ui,sans-serif;overflow-x:hidden}
+
+/* ── Header ─────────────────────────────────────────────────────── */
+header{background:var(--panel);border-bottom:1px solid var(--border);
+  padding:12px 20px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+header h1{font-size:15px;font-weight:700;white-space:nowrap}
+.module-pill{padding:3px 10px;border-radius:4px;font-size:11px;
+  font-weight:700;letter-spacing:1px;background:rgba(230,168,23,.18);
+  color:var(--accent-head);border:1px solid var(--accent-head)}
+header span.subtitle{font-size:11px;color:var(--muted)}
+.tab-bar{display:flex;gap:4px;margin-left:auto}
+.tab{padding:6px 14px;border-radius:6px;font-size:12px;font-weight:600;
+  text-decoration:none;cursor:pointer;background:transparent;
+  border:1px solid var(--border);color:var(--muted);transition:.15s}
+.tab:hover{background:var(--hover);color:var(--text)}
+.tab.active{background:var(--accent-head);border-color:var(--accent-head);color:#0d1117}
+.hdr-right{display:flex;align-items:center;gap:10px}
+.conn-dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+.conn-dot.ok{background:var(--ok);box-shadow:0 0 6px rgba(61,186,110,.5)}
+.conn-dot.err{background:var(--danger)}
+.conn-dot.warn{background:var(--warn)}
+#server-inp{background:var(--el);border:1px solid var(--borderl);
+  border-radius:5px;padding:5px 10px;color:var(--text);font-size:12px;
+  outline:none;width:200px}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:6px 14px;
+  border:none;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer;
+  transition:.15s}
+.btn:active{transform:scale(.97)}
+.btn-p{background:var(--accent-head);color:#0d1117}
+.btn-p:hover{filter:brightness(1.1)}
+
+/* ── Hazard banner ──────────────────────────────────────────────── */
+.hazard-banner{padding:10px 14px;border-radius:8px;font-size:13px;
+  font-weight:700;letter-spacing:1px;text-align:center;margin-bottom:12px;
+  border:1px solid var(--border);background:var(--el);color:var(--ok)}
+
+/* ── Layout ─────────────────────────────────────────────────────── */
+.dashboard{display:grid;grid-template-columns:420px 1fr 280px;gap:14px;
+  padding:14px;min-height:calc(100vh - 52px)}
+.col{display:flex;flex-direction:column;gap:12px}
+.card{background:var(--panel);border:1px solid var(--border);
+  border-radius:10px;padding:16px;overflow:hidden}
+.card-title{font-size:10px;font-weight:700;text-transform:uppercase;
+  letter-spacing:1px;color:var(--muted);margin-bottom:12px}
+
+/* ── Radar ──────────────────────────────────────────────────────── */
+#radar-wrap{display:flex;flex-direction:column;align-items:center;gap:12px}
+#radar-svg{border-radius:50%;background:rgba(13,17,23,.6)}
+.radar-range-row{display:flex;align-items:center;gap:10px;width:100%}
+.radar-range-row label{font-size:11px;color:var(--muted);white-space:nowrap}
+input[type=range]{flex:1;accent-color:var(--accent-head)}
+#range-label{font-size:11px;font-weight:600;color:var(--accent-head);
+  white-space:nowrap;width:36px;text-align:right}
+
+/* ── Tables ─────────────────────────────────────────────────────── */
+.stbl{width:100%;border-collapse:collapse;font-size:11px;margin-top:4px}
+.stbl th{color:var(--muted);font-weight:600;text-align:left;padding:5px 6px;
+  border-bottom:1px solid var(--border);white-space:nowrap}
+.stbl td{padding:5px 6px;border-bottom:1px solid rgba(46,54,80,.4);
+  font-variant-numeric:tabular-nums}
+.stbl tr:hover td{background:var(--el)}
+.stbl td.dir{font-weight:600;color:var(--text)}
+.stbl td.dist{font-family:monospace;font-size:12px}
+
+.zone-pill{display:inline-block;padding:1px 7px;border-radius:8px;
+  font-size:10px;font-weight:700;letter-spacing:.4px}
+.zone-CRITICAL{background:rgba(224,92,92,.18);color:var(--c-CRITICAL)}
+.zone-DANGER  {background:rgba(224,124,60,.15);color:var(--c-DANGER)}
+.zone-WARNING {background:rgba(230,168,23,.15);color:var(--c-WARNING)}
+.zone-CAUTION {background:rgba(79,142,247,.15);color:var(--c-CAUTION)}
+.zone-ALERT   {background:rgba(61,186,110,.12);color:var(--c-ALERT)}
+.zone-CLEAR   {background:rgba(46,54,80,.5);color:var(--muted)}
+
+/* ── Motor ring ─────────────────────────────────────────────────── */
+#motor-wrap{position:relative;width:240px;height:240px;margin:0 auto 10px}
+#motor-svg{width:240px;height:240px}
+.motor-chip-row{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;
+  margin-top:6px}
+.mchip{padding:4px 10px;border-radius:12px;font-size:10px;font-weight:700;
+  letter-spacing:.4px;border:1px solid var(--border);background:var(--el);
+  color:var(--muted);transition:.2s}
+.mchip.active{border-color:var(--accent-head);color:#fff}
+.mtbl{width:100%;border-collapse:collapse;font-size:11px;margin-top:8px}
+.mtbl th{color:var(--muted);font-weight:600;text-align:left;padding:5px 6px;
+  border-bottom:1px solid var(--border);white-space:nowrap}
+.mtbl td{padding:5px 6px;border-bottom:1px solid rgba(46,54,80,.4)}
+
+/* ── IMU panel ──────────────────────────────────────────────────── */
+.imu-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.imu-cell{background:var(--el);border:1px solid var(--borderl);
+  border-radius:6px;padding:8px}
+.imu-cell .label{font-size:9px;text-transform:uppercase;letter-spacing:.6px;
+  color:var(--muted);margin-bottom:3px}
+.imu-cell .value{font-family:monospace;font-size:13px;font-weight:700}
+
+/* ── Power & system grid ────────────────────────────────────────── */
+.power-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.power-grid .cell{background:var(--el);border:1px solid var(--borderl);
+  border-radius:6px;padding:8px;display:flex;flex-direction:column;gap:2px}
+.power-grid .cell .label{font-size:9px;text-transform:uppercase;
+  letter-spacing:.6px;color:var(--muted)}
+.power-grid .cell .value{font-family:monospace;font-size:13px;font-weight:700}
+.power-grid .cell .value.ok{color:var(--ok)}
+.power-grid .cell .value.warn{color:var(--warn)}
+.power-grid .cell .value.danger{color:var(--danger)}
+
+/* ── Stats grid ─────────────────────────────────────────────────── */
+.stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.stats-grid .cell{background:var(--el);border:1px solid var(--borderl);
+  border-radius:6px;padding:8px}
+.stats-grid .cell .label{font-size:9px;text-transform:uppercase;
+  letter-spacing:.6px;color:var(--muted);margin-bottom:3px}
+.stats-grid .cell .value{font-family:monospace;font-size:13px;font-weight:700}
+
+/* ── mmWave list ────────────────────────────────────────────────── */
+.mmw-row{display:grid;grid-template-columns:60px 1fr 1fr 1fr 70px;gap:6px;
+  padding:6px 4px;border-bottom:1px solid rgba(46,54,80,.4);
+  font-size:11px;align-items:center}
+.mmw-row.head{color:var(--muted);font-weight:600;text-transform:uppercase;
+  font-size:10px;letter-spacing:.5px}
+.mmw-row .val{font-family:monospace;font-variant-numeric:tabular-nums}
+.target-pill{display:inline-block;padding:1px 7px;border-radius:8px;
+  font-size:10px;font-weight:700}
+.target-pill.yes{background:rgba(224,124,60,.2);color:#e07c3c}
+.target-pill.no{background:rgba(46,54,80,.5);color:var(--muted)}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>OmniSense — Head Module Monitor</h1>
+  <span class="module-pill">HEAD</span>
+  <span class="subtitle">Hazard ring · 8 ToF · 2 mmWave · IMU · battery</span>
+  <div class="tab-bar">
+    <a class="tab" href="/dashboard">⬢ Combined</a>
+    <a class="tab active" href="/dashboard/head">◉ Head</a>
+    <a class="tab" href="/dashboard/body">◉ Body</a>
+  </div>
+  <div class="hdr-right">
+    <span class="conn-dot" id="cdot"></span>
+    <span id="cstat" style="font-size:11px;color:var(--muted)">Disconnected</span>
+    <input id="server-inp" type="text" placeholder="Server URL"/>
+    <button class="btn btn-p" id="conn-btn" onclick="toggleConnect()">Connect</button>
+  </div>
+</header>
+
+<div class="dashboard">
+
+  <!-- LEFT: Radar + Per-Direction Table -->
+  <div class="col">
+    <div class="card">
+      <div class="card-title">Head Obstacle Radar · ToF Distances</div>
+      <div id="hazard-banner" class="hazard-banner">CLEAR</div>
+      <div id="radar-wrap">
+        <svg id="radar-svg" width="380" height="380" viewBox="0 0 380 380"></svg>
+        <div class="radar-range-row">
+          <label>Max range</label>
+          <input type="range" id="range-slider" min="1" max="12" value="6" step="0.5"
+            oninput="radarMaxM=+this.value;document.getElementById('range-label').textContent=this.value+'m';renderAll(latest)"/>
+          <span id="range-label">6m</span>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Per-Direction ToF (Head) vs Fused</div>
+      <table class="stbl" id="sensor-tbl">
+        <thead><tr>
+          <th>Dir</th><th>ToF Head</th><th>Fused</th><th>Zone</th><th>Source</th>
+        </tr></thead>
+        <tbody id="sensor-tbl-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- MIDDLE: Hazard Motor Ring + Motor Detail + mmWave -->
+  <div class="col">
+    <div class="card">
+      <div class="card-title">Head Hazard Motor Ring · Server-Commanded</div>
+      <div id="motor-wrap">
+        <svg id="motor-svg" viewBox="0 0 220 220"></svg>
+      </div>
+      <div class="motor-chip-row" id="motor-chips"></div>
+    </div>
+    <div class="card" style="flex:1">
+      <div class="card-title">Motor Command Detail (8 head haptics)</div>
+      <table class="mtbl" id="motor-tbl">
+        <thead><tr>
+          <th>Motor</th><th>Direction</th><th>Zone</th>
+          <th>Intensity</th><th>Freq</th><th>Pattern</th>
+        </tr></thead>
+        <tbody id="motor-tbl-body"></tbody>
+      </table>
+      <div style="margin-top:14px">
+        <div class="card-title">mmWave Sensors (Head)</div>
+        <div id="mmwave-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RIGHT: IMU + Power + Stats -->
+  <div class="col">
+    <div class="card">
+      <div class="card-title">IMU — Head</div>
+      <div class="imu-grid" id="imu-panel"></div>
+      <div id="imu-notice" style="display:none;padding:10px;background:var(--el);
+           border:1px dashed var(--borderl);border-radius:6px;text-align:center;
+           font-size:11px;color:var(--muted);margin-top:8px">
+        <div style="font-size:13px;color:var(--accent-head,#3da3ba);margin-bottom:4px">
+          No IMU on this module
+        </div>
+        Current build mounts a single ICM-20948 on the body module.
+        Open the
+        <a href="/dashboard/body" style="color:var(--accent-body,#3dba6e)">Body dashboard</a>
+        for orientation and turn data.
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Power &amp; System (Head)</div>
+      <div class="power-grid" id="power-panel"></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Packet Statistics (Head)</div>
+      <div class="stats-grid" id="stats-panel"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+"use strict";
+
+// ─── Constants ─────────────────────────────────────────────────────────────
+const DIRS = ["front","front_right","right","back_right","back","back_left","left","front_left"];
+const DIR_LABELS = {
+  front:"F",front_right:"FR",right:"R",back_right:"BR",
+  back:"B",back_left:"BL",left:"L",front_left:"FL"
+};
+const DIR_FULL = {
+  front:"Front",front_right:"Front-Right",right:"Right",back_right:"Back-Right",
+  back:"Back",back_left:"Back-Left",left:"Left",front_left:"Front-Left"
+};
+const ZONE_COLORS = {
+  CRITICAL:"#e05c5c",DANGER:"#e07c3c",WARNING:"#e6a817",
+  CAUTION:"#4f8ef7",ALERT:"#3dba6e",CLEAR:"#2e3650"
+};
+const ZONE_LEVELS = {CLEAR:0,ALERT:1,CAUTION:2,WARNING:3,DANGER:4,CRITICAL:5};
+
+// ─── State ─────────────────────────────────────────────────────────────────
+let serverUrl = "http://localhost:5000";
+let connected = false;
+let liveTimer = null;
+let radarMaxM = 6;
+let latest = null;
+
+// ─── Connection ────────────────────────────────────────────────────────────
+function toggleConnect(){ connected ? disconnect() : connect(); }
+
+async function connect(){
+  serverUrl = document.getElementById("server-inp").value.trim().replace(/\/$/,"");
+  if(!serverUrl){ serverUrl = "http://" + location.host; }
+  setConnStatus("connecting");
+  try{
+    const r = await fetch(`${serverUrl}/status`, {signal: AbortSignal.timeout(4000)});
+    if(!r.ok) throw new Error(`HTTP ${r.status}`);
+    connected = true;
+    setConnStatus("ok");
+    document.getElementById("conn-btn").textContent = "Disconnect";
+    liveTimer = setInterval(fetchLive, 300);
+    fetchLive();
+  } catch(e){
+    setConnStatus("err");
+    document.getElementById("cstat").textContent = "Failed: " + e.message;
+    document.getElementById("conn-btn").textContent = "Connect";
+  }
+}
+function disconnect(){
+  connected = false;
+  if(liveTimer){ clearInterval(liveTimer); liveTimer = null; }
+  setConnStatus("off");
+  document.getElementById("conn-btn").textContent = "Connect";
+}
+function setConnStatus(s){
+  const dot = document.getElementById("cdot");
+  const lbl = document.getElementById("cstat");
+  let cls = "conn-dot";
+  if(s === "ok")        cls += " ok";
+  else if(s === "err")  cls += " err";
+  else if(s === "warn") cls += " warn";
+  dot.className = cls;
+  lbl.textContent = s==="ok"        ? "Connected"
+                  : s==="connecting"? "Connecting…"
+                  : s==="err"       ? "Error"
+                  : s==="warn"      ? "Head offline"
+                  :                   "Disconnected";
+}
+
+// ─── Polling ───────────────────────────────────────────────────────────────
+async function fetchLive(){
+  if(!connected) return;
+  try{
+    const r = await fetch(`${serverUrl}/sensor_state/head`,
+                          {signal: AbortSignal.timeout(1000)});
+    if(r.status === 204){ setConnStatus("warn"); return; }
+    if(!r.ok) throw new Error();
+    const d = await r.json();
+    if(d.status === "ok"){
+      latest = d;
+      setConnStatus(d.online === false ? "warn" : "ok");
+      renderAll(d);
+    }
+  } catch { /* keep last frame, ignore transient errors */ }
+}
+
+// ─── Render dispatcher ────────────────────────────────────────────────────
+function renderAll(data){
+  if(!data) return;
+  drawRadar(data.tof || {}, data.fused || {});
+  renderHazardBanner(data.hazard);
+  renderSensorTable(data);
+  drawMotorRing(data.motors || []);
+  renderMotorTable(data.motors || []);
+  renderMmwave(data.mmwave || {});
+  renderImu(data.imu || {});
+  renderPower(data);
+  renderStats(data);
+}
+
+// ─── Hazard banner ────────────────────────────────────────────────────────
+function renderHazardBanner(h){
+  const el = document.getElementById("hazard-banner");
+  if(!h || !h.label){ el.textContent = "CLEAR"; el.style.color = "var(--ok)";
+                       el.style.borderColor = "var(--border)"; return; }
+  el.textContent = `${h.label}` + (h.alerts && h.alerts.length
+                ? ` · ${h.alerts.length} active alert${h.alerts.length>1?"s":""}` : "");
+  el.style.color = ZONE_COLORS[h.label] || "var(--ok)";
+  el.style.borderColor = ZONE_COLORS[h.label] || "var(--border)";
+  el.style.background = `${ZONE_COLORS[h.label] || "transparent"}22`;
+}
+
+// ─── Radar SVG (380×380) ───────────────────────────────────────────────────
+const R_CX = 190, R_CY = 190, CHART_R = 168;
+function polarXY(deg, r, cx, cy){
+  const rad = (deg - 90) * Math.PI / 180;
+  return [cx + r*Math.cos(rad), cy + r*Math.sin(rad)];
+}
+function annularSectorPath(s, e, ir, or_, cx, cy){
+  if(or_ < 1) return "";
+  const [ox1,oy1] = polarXY(s, or_, cx, cy);
+  const [ox2,oy2] = polarXY(e, or_, cx, cy);
+  const lg = e - s > 180 ? 1 : 0;
+  if(ir < 1){
+    return `M ${cx} ${cy} L ${ox1.toFixed(2)} ${oy1.toFixed(2)} `
+         + `A ${or_.toFixed(2)} ${or_.toFixed(2)} 0 ${lg} 1 ${ox2.toFixed(2)} ${oy2.toFixed(2)} Z`;
+  }
+  const [ix1,iy1] = polarXY(s, ir, cx, cy);
+  const [ix2,iy2] = polarXY(e, ir, cx, cy);
+  return `M ${ox1.toFixed(2)} ${oy1.toFixed(2)} `
+       + `A ${or_.toFixed(2)} ${or_.toFixed(2)} 0 ${lg} 1 ${ox2.toFixed(2)} ${oy2.toFixed(2)} `
+       + `L ${ix2.toFixed(2)} ${iy2.toFixed(2)} `
+       + `A ${ir.toFixed(2)} ${ir.toFixed(2)} 0 ${lg} 0 ${ix1.toFixed(2)} ${iy1.toFixed(2)} Z`;
+}
+
+function drawRadar(tof, fused){
+  const svg = document.getElementById("radar-svg");
+  if(!svg) return;
+  const cx = R_CX, cy = R_CY, R = CHART_R;
+  const lines = [];
+
+  lines.push(`<circle cx="${cx}" cy="${cy}" r="${R}" fill="#0b0f1a" stroke="#2e3650" stroke-width="1"/>`);
+
+  const ringDists = [0.5,1.0,1.5,3.0,5.0].filter(d => d < radarMaxM).concat([radarMaxM]);
+  ringDists.forEach(d => {
+    const r = (d / radarMaxM) * R;
+    const col = d <= 0.5 ? ZONE_COLORS.CRITICAL :
+                d <= 1.0 ? ZONE_COLORS.DANGER   :
+                d <= 1.5 ? ZONE_COLORS.WARNING  :
+                d <= 3.0 ? ZONE_COLORS.CAUTION  : "#2e3650";
+    lines.push(`<circle cx="${cx}" cy="${cy}" r="${r.toFixed(1)}" fill="none" stroke="${col}" stroke-width="0.7" stroke-dasharray="3 4" opacity="0.35"/>`);
+    const [lx,ly] = polarXY(0, r, cx, cy);
+    lines.push(`<text x="${(lx+3).toFixed(1)}" y="${(ly-3).toFixed(1)}" font-size="8" fill="${col}" opacity="0.7">${d}m</text>`);
+  });
+
+  DIRS.forEach((_,i) => {
+    const [x2,y2] = polarXY(i*45, R, cx, cy);
+    lines.push(`<line x1="${cx}" y1="${cy}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}" stroke="#1e2535" stroke-width="1"/>`);
+  });
+
+  // Per-direction wedges based on the head's own ToF reading.
+  DIRS.forEach((dir,i) => {
+    const dist = tof[dir];
+    if(dist == null) return;
+    const dClamp = Math.min(dist, radarMaxM);
+    const r = (dClamp / radarMaxM) * R;
+    const fz = (fused[dir] && fused[dir].zone) || classifyZone(dist);
+    const col = ZONE_COLORS[fz] || ZONE_COLORS.CLEAR;
+    const start = i*45 - 22.5, end = i*45 + 22.5;
+    lines.push(`<path d="${annularSectorPath(start, end, 0, r, cx, cy)}" fill="${col}" opacity="0.55"/>`);
+  });
+
+  // Direction labels around the perimeter.
+  DIRS.forEach((dir, i) => {
+    const [tx,ty] = polarXY(i*45, R + 14, cx, cy);
+    lines.push(`<text x="${tx.toFixed(1)}" y="${ty.toFixed(1)}" font-size="10" font-weight="700" fill="#7a88a4" text-anchor="middle" dominant-baseline="middle">${DIR_LABELS[dir]}</text>`);
+  });
+
+  // Centre marker.
+  lines.push(`<circle cx="${cx}" cy="${cy}" r="4" fill="#e6a817" stroke="#0d1117" stroke-width="1"/>`);
+
+  svg.innerHTML = lines.join("\n");
+}
+
+function classifyZone(d){
+  if(d == null) return "CLEAR";
+  if(d <= 0.5) return "CRITICAL";
+  if(d <= 1.0) return "DANGER";
+  if(d <= 1.5) return "WARNING";
+  if(d <= 3.0) return "CAUTION";
+  if(d <= 5.0) return "ALERT";
+  return "CLEAR";
+}
+
+// ─── Per-direction sensor table ───────────────────────────────────────────
+function renderSensorTable(d){
+  const tof   = d.tof   || {};
+  const fused = d.fused || {};
+  const tbody = document.getElementById("sensor-tbl-body");
+  tbody.innerHTML = DIRS.map(dir => {
+    const tofVal = tof[dir];
+    const fz     = fused[dir] || {};
+    const zone   = fz.zone || classifyZone(tofVal);
+    const fusedDist = fz.dist_m;
+    return `<tr>
+      <td class="dir">${DIR_FULL[dir]}</td>
+      <td class="dist">${tofVal == null ? "—" : tofVal.toFixed(2) + " m"}</td>
+      <td class="dist">${fusedDist == null ? "—" : fusedDist.toFixed(2) + " m"}</td>
+      <td><span class="zone-pill zone-${zone}">${zone}</span></td>
+      <td>${fz.source || "head"}</td>
+    </tr>`;
+  }).join("");
+}
+
+// ─── Motor ring (8 head haptics) ──────────────────────────────────────────
+const M_CX = 110, M_CY = 110, M_OUTER = 90, M_INNER = 38;
+function drawMotorRing(motors){
+  const svg = document.getElementById("motor-svg");
+  if(!svg) return;
+
+  // Build a quick lookup motor_id → motor entry.
+  const byId = {};
+  motors.forEach(m => { byId[m.motor_id] = m; });
+
+  const lines = [];
+  for(let i = 0; i < 8; i++){
+    const m = byId[i] || {};
+    const dir = m.direction || DIRS[i];
+    const active = !!m.active;
+    const intensity = +m.intensity || 0;
+    const zone = m.zone || "CLEAR";
+    const baseCol = ZONE_COLORS[zone] || ZONE_COLORS.CLEAR;
+    const opacity = active ? Math.max(0.35, intensity / 255) : 0.15;
+    const start = i*45 - 22.5, end = i*45 + 22.5;
+    lines.push(`<path d="${annularSectorPath(start, end, M_INNER, M_OUTER, M_CX, M_CY)}" fill="${baseCol}" opacity="${opacity.toFixed(2)}" stroke="${active ? '#fff' : '#1e2535'}" stroke-width="${active ? 1.2 : 0.6}"/>`);
+
+    const [lx,ly] = polarXY(i*45, (M_INNER+M_OUTER)/2, M_CX, M_CY);
+    lines.push(`<text x="${lx.toFixed(1)}" y="${ly.toFixed(1)}" font-size="9" font-weight="700" fill="${active ? '#fff' : '#7a88a4'}" text-anchor="middle" dominant-baseline="middle">${DIR_LABELS[dir]}</text>`);
+  }
+  // Inner circle marker.
+  lines.push(`<circle cx="${M_CX}" cy="${M_CY}" r="${M_INNER-4}" fill="#0b0f1a" stroke="#2e3650"/>`);
+  lines.push(`<text x="${M_CX}" y="${M_CY}" font-size="10" font-weight="700" fill="#e6a817" text-anchor="middle" dominant-baseline="middle">HEAD</text>`);
+  svg.innerHTML = lines.join("\n");
+
+  // Chips below the ring.
+  const chips = document.getElementById("motor-chips");
+  chips.innerHTML = DIRS.map((dir, i) => {
+    const m = byId[i] || {};
+    const active = !!m.active;
+    return `<span class="mchip${active ? ' active' : ''}">${DIR_LABELS[dir]} ${m.intensity || 0}</span>`;
+  }).join("");
+}
+
+function renderMotorTable(motors){
+  const tbody = document.getElementById("motor-tbl-body");
+  if(!motors.length){
+    tbody.innerHTML = `<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:12px">No motor commands yet</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = motors.map(m => `
+    <tr>
+      <td>M${m.motor_id}</td>
+      <td class="dir">${DIR_FULL[m.direction] || m.direction}</td>
+      <td><span class="zone-pill zone-${m.zone}">${m.zone}</span></td>
+      <td>${m.intensity || 0}/255</td>
+      <td>${m.freq_hz != null ? m.freq_hz + " Hz" : "—"}</td>
+      <td style="color:${m.active ? 'var(--text)' : 'var(--muted)'}">${m.pattern || "off"}</td>
+    </tr>
+  `).join("");
+}
+
+// ─── mmWave list ──────────────────────────────────────────────────────────
+function renderMmwave(mmwave){
+  const wrap = document.getElementById("mmwave-list");
+  const sensors = Object.entries(mmwave);
+  if(!sensors.length){
+    wrap.innerHTML = `<div style="color:var(--muted);font-size:11px;padding:8px">No mmWave data yet</div>`;
+    return;
+  }
+  let html = `<div class="mmw-row head"><span>Sensor</span><span>Target</span><span>Range (m)</span><span>Speed (m/s)</span><span>Status</span></div>`;
+  sensors.forEach(([key, v]) => {
+    const target = v && v.target_detected ? "yes" : "no";
+    const range  = v && v.range_m != null ? v.range_m.toFixed(2) : "—";
+    const speed  = v && v.speed_mps != null ? v.speed_mps.toFixed(2) : "—";
+    const ok     = v && v.healthy !== false;
+    html += `
+      <div class="mmw-row">
+        <span style="font-weight:600">${key}</span>
+        <span><span class="target-pill ${target}">${target.toUpperCase()}</span></span>
+        <span class="val">${range}</span>
+        <span class="val">${speed}</span>
+        <span style="color:${ok ? 'var(--ok)' : 'var(--danger)'};font-weight:600;font-size:10px">${ok ? "OK" : "FAIL"}</span>
+      </div>`;
+  });
+  wrap.innerHTML = html;
+}
+
+// ─── IMU panel ────────────────────────────────────────────────────────────
+function renderImu(imu){
+  const wrap   = document.getElementById("imu-panel");
+  const notice = document.getElementById("imu-notice");
+  const fmt = (v, suf) => v == null ? "—" : (typeof v === "number" ? v.toFixed(2) : v) + (suf || "");
+
+  // Current build: head module has no IMU. The firmware sends an empty {}
+  // for imu, so detect that and show the "not equipped" notice instead of
+  // a grid of fake zeros.
+  const hasData = imu && (imu.roll_deg !== undefined || imu.yaw_deg !== undefined
+                          || imu.accel_x !== undefined);
+  if (!hasData) {
+    wrap.style.display   = "none";
+    if (notice) notice.style.display = "block";
+    return;
+  }
+  wrap.style.display   = "grid";
+  if (notice) notice.style.display = "none";
+
+  wrap.innerHTML = `
+    <div class="imu-cell"><div class="label">Roll</div><div class="value">${fmt(imu.roll_deg, "°")}</div></div>
+    <div class="imu-cell"><div class="label">Pitch</div><div class="value">${fmt(imu.pitch_deg, "°")}</div></div>
+    <div class="imu-cell"><div class="label">Yaw</div><div class="value">${fmt(imu.yaw_deg, "°")}</div></div>
+    <div class="imu-cell"><div class="label">|a| (g)</div><div class="value">${imu.accel_x == null ? "—" : (Math.hypot(imu.accel_x||0, imu.accel_y||0, imu.accel_z||0) / 9.81).toFixed(2)}</div></div>
+    <div class="imu-cell"><div class="label">a<sub>x</sub></div><div class="value">${fmt(imu.accel_x, " m/s²")}</div></div>
+    <div class="imu-cell"><div class="label">a<sub>y</sub></div><div class="value">${fmt(imu.accel_y, " m/s²")}</div></div>
+    <div class="imu-cell"><div class="label">a<sub>z</sub></div><div class="value">${fmt(imu.accel_z, " m/s²")}</div></div>
+    <div class="imu-cell"><div class="label">Stable</div><div class="value">${imu.stable === false ? "no" : "yes"}</div></div>
+  `;
+}
+
+// ─── Power panel ──────────────────────────────────────────────────────────
+function renderPower(d){
+  const b = d.battery || {};
+  const s = d.system  || {};
+  const wrap = document.getElementById("power-panel");
+  const v   = b.voltage_v;
+  const soc = b.soc_pct;
+  const t   = s.die_temp_c;
+  const heap= s.free_heap_b;
+  const rssi= s.wifi_rssi;
+  const up  = d.uptime_s;
+
+  const vCls   = v   == null ? "" : (v < 3.4 ? "value danger" : v < 3.6 ? "value warn" : "value ok");
+  const socCls = soc == null ? "" : (soc < 20 ? "value danger" : soc < 40 ? "value warn" : "value ok");
+  const rssiCls= rssi== null ? "" : (rssi < -80 ? "value danger" : rssi < -65 ? "value warn" : "value ok");
+  const tCls   = t   == null ? "" : (t > 60 ? "value danger" : t > 50 ? "value warn" : "value ok");
+
+  wrap.innerHTML = `
+    <div class="cell"><span class="label">Battery V</span><span class="${vCls || 'value'}">${v == null ? "—" : v.toFixed(2) + " V"}</span></div>
+    <div class="cell"><span class="label">SoC</span><span class="${socCls || 'value'}">${soc == null ? "—" : soc.toFixed(0) + " %"}</span></div>
+    <div class="cell"><span class="label">Die Temp</span><span class="${tCls || 'value'}">${t == null ? "—" : t.toFixed(1) + " °C"}</span></div>
+    <div class="cell"><span class="label">Free Heap</span><span class="value">${heap == null ? "—" : (heap/1024).toFixed(0) + " KB"}</span></div>
+    <div class="cell"><span class="label">WiFi RSSI</span><span class="${rssiCls || 'value'}">${rssi == null ? "—" : rssi + " dBm"}</span></div>
+    <div class="cell"><span class="label">Uptime</span><span class="value">${up == null ? "—" : formatUptime(up)}</span></div>
+  `;
+}
+function formatUptime(s){
+  s = +s || 0;
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), ss = Math.floor(s%60);
+  if(h) return `${h}h ${m}m`;
+  if(m) return `${m}m ${ss}s`;
+  return `${ss}s`;
+}
+
+// ─── Stats panel ──────────────────────────────────────────────────────────
+function renderStats(d){
+  const wrap = document.getElementById("stats-panel");
+  const onCls = d.online ? "value" : "value";
+  const onColor = d.online ? "var(--ok)" : "var(--danger)";
+  wrap.innerHTML = `
+    <div class="cell"><span class="label">Status</span><span class="value" style="color:${onColor}">${d.online ? "ONLINE" : "OFFLINE"}</span></div>
+    <div class="cell"><span class="label">Idle</span><span class="${onCls}">${d.idle_since_ms == null ? "—" : (d.idle_since_ms < 1000 ? d.idle_since_ms.toFixed(0) + " ms" : (d.idle_since_ms/1000).toFixed(1) + " s")}</span></div>
+    <div class="cell"><span class="label">Pkts</span><span class="value">${d.packet_count ?? 0}</span></div>
+    <div class="cell"><span class="label">Rate</span><span class="value">${d.pkt_rate_hz == null ? "—" : d.pkt_rate_hz.toFixed(1) + " Hz"}</span></div>
+    <div class="cell"><span class="label">Latency</span><span class="value">${d.latency_ms == null ? "—" : d.latency_ms.toFixed(0) + " ms"}</span></div>
+    <div class="cell"><span class="label">Proc avg</span><span class="value">${d.proc_avg_ms == null ? "—" : d.proc_avg_ms.toFixed(1) + " ms"}</span></div>
+    <div class="cell"><span class="label">Iv min/avg/max</span><span class="value" style="font-size:11px">${d.interval_min_ms == null ? "—" : `${d.interval_min_ms.toFixed(0)}/${(d.interval_avg_ms||0).toFixed(0)}/${(d.interval_max_ms||0).toFixed(0)}`}</span></div>
+    <div class="cell"><span class="label">Device ID</span><span class="value" style="font-size:10px">${d.device_id || "—"}</span></div>
+  `;
+}
+
+// ─── Tab link rewriter ───────────────────────────────────────────────────
+// The pages can be served two ways:
+//   1. Through Flask  → URLs like /dashboard, /dashboard/head, /dashboard/body
+//   2. Through a plain static file server (e.g. python -m http.server 8080)
+//      → URLs like sensor_dashboard.html, head_dashboard.html, body_dashboard.html
+// Detect the deployment from location.pathname and rewrite the tab anchors
+// accordingly so navigation works in either context.
+function fixTabLinks(){
+  const isFlask = location.pathname.startsWith("/dashboard");
+  const map = isFlask
+    ? {"/dashboard":"/dashboard", "/dashboard/head":"/dashboard/head", "/dashboard/body":"/dashboard/body"}
+    : {"/dashboard":"sensor_dashboard.html", "/dashboard/head":"head_dashboard.html", "/dashboard/body":"body_dashboard.html"};
+  document.querySelectorAll("a.tab").forEach(a => {
+    const href = a.getAttribute("href");
+    if(map[href]) a.setAttribute("href", map[href]);
+  });
+}
+
+// ─── Init ─────────────────────────────────────────────────────────────────
+window.addEventListener("DOMContentLoaded", () => {
+  fixTabLinks();
+  // Default the server URL to the page's own host so /dashboard/head works
+  // when served by Flask, but still allow editing for static-file viewing.
+  const inp = document.getElementById("server-inp");
+  inp.value = `http://${location.hostname || "localhost"}:5000`;
+  drawRadar({}, {});
+  drawMotorRing([]);
+  // Auto-connect when served by the Flask app.
+  if(location.protocol === "http:" || location.protocol === "https:"){
+    connect();
+  }
+});
+</script>
+</body>
+</html>
