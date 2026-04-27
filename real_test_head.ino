@@ -224,6 +224,9 @@ struct TofSensor {
 // One Adafruit driver per sensor slot — all stay at 0x29; MUX isolates them.
 static Adafruit_VL53L1X tofDev[8];
 
+// millis() timestamp of last *accepted* VL53 sample per slot (0 = never)
+static uint32_t tofLastValidMs[8];
+
 //                  name          mux_ch  xshut  present  last   cnt    min    max  sum  err
 // XSHUT pin assignments — avoid strapping pins GPIO45 (VDD_SPI sel) and GPIO46 (ROM log)
 static TofSensor tofs[8] = {
@@ -328,7 +331,7 @@ static void updateHaptics() {
   for (uint8_t i = 0; i < 8; i++) {
     if (!drvs[i].present) continue;
     uint8_t target = 0;
-    if (tofs[i].present && tofs[i].count > 0 && tofs[i].last_mm >= 0) {
+    if (tofs[i].present && tofs[i].last_mm >= 0) {
       int16_t d = tofs[i].last_mm;
       if      (d <= HAPTIC_CRITICAL_MM) target = 127;
       else if (d <= HAPTIC_WARNING_MM)  target = 70;
@@ -509,24 +512,57 @@ static void initToFSensors() {
   Serial.println("]");
 }
 
+// VL53L1X validity band (mm) — harmonics / wrap often show as <40 mm junk.
+#define TOF_MIN_VALID_MM   40
+#define TOF_MAX_VALID_MM   4000
+// Hold the last *accepted* distance for this long with no new valid sample
+// before clearing (reduces UI / haptic flicker from brief VL53 drop-outs).
+#define TOF_STALE_MS       1000u
+
+static void tofResetSlot(uint8_t i) {
+  tofs[i].last_mm = -1;
+  tofs[i].count   = 0;
+  tofs[i].sum_mm  = 0;
+  tofs[i].min_mm  = 32767;
+  tofs[i].max_mm  = 0;
+  tofLastValidMs[i] = 0;
+}
+
 // ── ToF polling — non-blocking, call every loop() iteration ──────────────────
 static void readToFSensors() {
+  uint32_t now = millis();
   for (uint8_t i = 0; i < 8; i++) {
     if (!tofs[i].present) continue;
     muxSelect(tofs[i].mux_ch);
     delayMicroseconds(200);              // brief settling after channel switch
+
+    // No accepted sample for ≥1 s (e.g. I2C / driver silent) → clear latched read.
+    if (tofs[i].last_mm >= 0 && tofLastValidMs[i] != 0
+        && (uint32_t)(now - tofLastValidMs[i]) > TOF_STALE_MS) {
+      tofResetSlot(i);
+    }
+
     if (!tofDev[i].dataReady()) continue;
+
     int16_t d = tofDev[i].distance();
     tofDev[i].clearInterrupt();
-    if (d < 0) {
+
+    const bool inBand = (d >= TOF_MIN_VALID_MM && d <= TOF_MAX_VALID_MM);
+    if (d < 0 || !inBand) {
       tofs[i].err_count++;
-    } else {
-      tofs[i].last_mm = d;
-      tofs[i].count++;
-      tofs[i].sum_mm += d;
-      if (d < tofs[i].min_mm) tofs[i].min_mm = d;
-      if (d > tofs[i].max_mm) tofs[i].max_mm = d;
+      // Explicit "no read" this frame → clear immediately so JSON / monitor show empty.
+      if (tofs[i].last_mm >= 0) {
+        tofResetSlot(i);
+      }
+      continue;
     }
+
+    tofs[i].last_mm = d;
+    tofs[i].count++;
+    tofs[i].sum_mm += d;
+    if (d < tofs[i].min_mm) tofs[i].min_mm = d;
+    if (d > tofs[i].max_mm) tofs[i].max_mm = d;
+    tofLastValidMs[i] = now;
   }
   muxSelect(0xFF);  // disable all channels when done
 }
@@ -658,7 +694,8 @@ static void sendNavData(float voltage, float soc, float tempC, uint32_t freeHeap
   // ToF sensors
   JsonObject tofObj = doc.createNestedObject("tof_sensors");
   for (uint8_t i = 0; i < 8; i++) {
-    if (!tofs[i].present || tofs[i].count == 0) {
+    // Empty object = no valid current sample (do not ship stale last_mm after reset)
+    if (!tofs[i].present || tofs[i].last_mm < 0) {
       tofObj.createNestedObject(tofs[i].name);
     } else {
       JsonObject s = tofObj.createNestedObject(tofs[i].name);

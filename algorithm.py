@@ -95,6 +95,9 @@ logger = logging.getLogger("omnisense.algorithm")
 TOF_MAX_RANGE_M   = 5.0     # metres  – VL53L1X useful range
 MMWAVE_MAX_RANGE_M = 12.0   # metres  – TI mmWave useful range
 TOF_INVALID_MM    = 8190    # mm      – VL53L1X "no target" sentinel
+# Must match ESP32 firmware gate: reject wrap / harmonics / bogus near-zero.
+TOF_MIN_VALID_MM_FW = 40
+TOF_MAX_VALID_MM_FW = 4000
 TILT_THRESHOLD_DEG = 15.0   # degrees – tilt beyond which a channel WOULD be suppressed
                             # (only used when IMU_TILT_SUPPRESS_ENABLED is True)
 
@@ -284,6 +287,38 @@ def classify_distance(distance_m: float, module: str = "body") -> str:
 # Sensor parsing helpers
 # ---------------------------------------------------------------------------
 
+def _tof_subdict_to_raw_mm(reading: dict | None) -> int | None:
+    """
+    Extract one usable VL53 distance in millimetres from a single direction
+    object, or ``None`` if the firmware signalled "no sample" (``{}``) or the
+    values are out of band.
+
+    Prefer ``distance_mm`` when that key is present so we do not latch onto a
+    smoothed ``avg`` after the live sample has gone invalid on the wire.
+    """
+    if not isinstance(reading, dict) or not reading:
+        return None
+
+    def _coerce(val: object) -> int | None:
+        if val is None:
+            return None
+        try:
+            iv = int(float(val))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        if iv <= 0 or iv >= TOF_INVALID_MM:
+            return None
+        if iv < TOF_MIN_VALID_MM_FW or iv > TOF_MAX_VALID_MM_FW:
+            return None
+        return iv
+
+    if "distance_mm" in reading:
+        hit = _coerce(reading.get("distance_mm"))
+        if hit is not None:
+            return hit
+    return _coerce(reading.get("avg"))
+
+
 def _parse_tof_sensors(tof_data: dict) -> dict[str, float | None]:
     """
     Parse the ``tof_sensors`` sub-object from the ESP32 packet.
@@ -310,9 +345,11 @@ def _parse_tof_sensors(tof_data: dict) -> dict[str, float | None]:
         if reading is None:
             result[direction] = None
             continue
-        # Use distance_mm (most-recent reading) for accuracy; fall back to avg
-        raw_mm = reading.get("distance_mm") or reading.get("avg")
-        if raw_mm is None or raw_mm >= TOF_INVALID_MM or raw_mm <= 0:
+        if not isinstance(reading, dict):
+            result[direction] = None
+            continue
+        raw_mm = _tof_subdict_to_raw_mm(reading)
+        if raw_mm is None:
             result[direction] = None
         else:
             dist_m = raw_mm / 1000.0
@@ -1276,8 +1313,15 @@ def _merge_fused_dicts(
             eff_dist, source = dist_b, b["source"]
         else:
             eff_dist = None
-            # Preserve suppression annotation if either module suppressed the channel
-            source = a["source"] if "suppressed" in a["source"] else b["source"]
+            # Neither module has a range — do not inherit a misleading "tof" label
+            # from whichever dict happened to be chosen last.
+            sa, sb = a["source"], b["source"]
+            if "suppressed" in sa:
+                source = sa
+            elif "suppressed" in sb:
+                source = sb
+            else:
+                source = "none"
 
         # Reclassify with head thresholds – output is always for the head motors
         zone    = classify_distance(eff_dist, module="head") if eff_dist is not None else Zone.CLEAR

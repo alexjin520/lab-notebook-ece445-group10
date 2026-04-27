@@ -814,18 +814,27 @@ function computeRoute(origin, destination) {
     state.stepIndex  = 0;
     state.routeActive = true;
 
-    // Build sim path from route polyline
-    const path = result.routes[0].overview_path;
-    state.simPathPoints  = path;
+    // Build sim path from route polyline (MVCArray or plain array)
+    const rawPath = result.routes[0].overview_path;
+    const pathList =
+      rawPath && typeof rawPath.getLength === "function"
+        ? Array.from({ length: rawPath.getLength() }, (_, i) => rawPath.getAt(i))
+        : (Array.isArray(rawPath) ? rawPath : []);
+    state.simPathPoints  = pathList;
     state.simPointIndex  = 0;
+
+    const pathCoords = pathList.map((ll) => ({ lat: ll.lat(), lng: ll.lng() }));
+    const rawPoly = result.routes[0].overview_polyline;
+    const overviewPts =
+      rawPoly && typeof rawPoly.points === "string" ? rawPoly.points : null;
 
     // Show route details in sidebar
     renderStepsList();
     stepsSection.classList.remove("hidden");
     instructionCard.classList.remove("hidden");
 
-    // Send route to server
-    if (state.connected) sendRouteToServer(leg);
+    // Push route to server for logging / replay (same host as map; not gated on "connected")
+    void sendRouteToServer(leg, pathCoords, overviewPts);
 
     // Start position tracking
     startWatchingPosition();
@@ -997,7 +1006,8 @@ async function sendCommandToServer(command) {
       state.currentPos.lat, state.currentPos.lng,
       step.end_lat, step.end_lng
     ) : null,
-    phase: "execute",
+    phase:      "execute",
+    step_index: state.stepIndex,
   };
   try {
     await fetch(`${state.serverUrl}/nav/set_command`, {
@@ -1008,8 +1018,7 @@ async function sendCommandToServer(command) {
   } catch { /* silently ignore */ }
 }
 
-async function sendRouteToServer(leg) {
-  if (!state.connected) return;
+async function sendRouteToServer(leg, pathCoords, overviewPolylinePoints) {
   const payload = {
     origin:           { lat: leg.start_location.lat(), lng: leg.start_location.lng() },
     destination:      { lat: leg.end_location.lat(),   lng: leg.end_location.lng() },
@@ -1018,14 +1027,16 @@ async function sendRouteToServer(leg) {
     total_distance_m: leg.distance.value,
     total_duration_s: leg.duration.value,
     active:           true,
+    path_coords:      pathCoords && pathCoords.length ? pathCoords : [],
   };
+  if (overviewPolylinePoints) payload.overview_polyline = overviewPolylinePoints;
   try {
     await fetch(`${state.serverUrl}/nav/set_route`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-  } catch { /* ignore */ }
+  } catch { /* ignore — server may be offline while browsing the map */ }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>OmniSense — Second-Clock Monitor (1 Hz, video-sync)</title>
+<style>
+  :root {
+    --bg:#0e1218; --panel:#161c25; --el:#1e2530; --border:#2a323e;
+    --fg:#e9eef5; --muted:#7a8699; --accent:#5aa9ff;
+    --ok:#2ecc71; --warn:#f1c40f; --danger:#e67e22; --critical:#e74c3c;
+    --caution:#3498db;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--fg);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display:flex; align-items:center; gap:24px;
+    padding:12px 24px; border-bottom:1px solid var(--border);
+    background:linear-gradient(180deg,#1a2230 0,var(--panel) 100%);
+  }
+  h1 { font-size:18px; margin:0; letter-spacing:.04em; }
+  .subtitle { color:var(--muted); font-size:12px; }
+
+  .demo-clock {
+    margin-left:auto;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size:48px; font-weight:600; letter-spacing:.04em;
+    color:#fff; text-shadow:0 0 12px rgba(90,169,255,.4);
+    padding:4px 22px; border:2px solid var(--accent); border-radius:10px;
+    background:rgba(90,169,255,.08); min-width:170px; text-align:center;
+  }
+  .demo-clock.paused { border-color:var(--muted); color:var(--muted); }
+  .demo-clock small {
+    display:block; font-size:11px; font-weight:400; letter-spacing:.06em;
+    color:var(--muted); margin-top:-4px;
+  }
+
+  .replay-bar {
+    display:flex; align-items:center; gap:12px; padding:10px 24px;
+    border-bottom:1px solid var(--border); background:var(--panel);
+  }
+  .replay-bar button {
+    background:var(--el); color:var(--fg); border:1px solid var(--border);
+    padding:6px 14px; border-radius:6px; cursor:pointer;
+  }
+  .replay-bar button:hover { border-color:var(--accent); }
+  .replay-bar input[type=range] { flex:1; min-width:200px; }
+  .replay-bar .info { color:var(--muted); font-size:12px; }
+  .drop-zone {
+    border:2px dashed var(--border); padding:8px 16px; border-radius:6px;
+    color:var(--muted); cursor:pointer; transition:border-color .15s;
+    flex:1;
+  }
+  .drop-zone:hover, .drop-zone.drag-over {
+    border-color:var(--accent); color:var(--fg);
+  }
+
+  main { display:grid; grid-template-columns: 1fr 1fr; gap:18px; padding:18px 24px; }
+  .card {
+    background:var(--panel); border:1px solid var(--border); border-radius:10px;
+    padding:14px;
+  }
+  .card h2 {
+    font-size:13px; margin:0 0 10px; color:var(--muted); letter-spacing:.08em;
+    text-transform:uppercase;
+  }
+  .full { grid-column: 1 / -1; }
+
+  .haz-banner {
+    padding:10px 14px; border-radius:8px; border:1px solid var(--border);
+    background:var(--el); font-size:16px; font-weight:600;
+    display:flex; justify-content:space-between; align-items:center;
+  }
+  .haz-banner.WARNING  { color:var(--warn); border-color:var(--warn); }
+  .haz-banner.DANGER   { color:var(--danger); border-color:var(--danger); }
+  .haz-banner.CRITICAL { color:var(--critical); border-color:var(--critical);
+                         box-shadow:0 0 12px rgba(231,76,60,.35); }
+  .haz-banner.CAUTION  { color:var(--caution); border-color:var(--caution); }
+
+  .radars { display:grid; grid-template-columns: 1fr 1fr; gap:14px; }
+  .radar-wrap { background:var(--el); border-radius:8px; padding:8px;
+                border:1px solid var(--border); }
+  .radar-wrap h3 { font-size:12px; margin:0 0 6px; color:var(--muted);
+                   letter-spacing:.08em; }
+  .radar { width:100%; aspect-ratio:1; }
+
+  table.dirs { width:100%; border-collapse:collapse; font-size:13px; }
+  table.dirs th, table.dirs td {
+    padding:5px 8px; border-bottom:1px solid var(--border);
+  }
+  table.dirs th { text-align:left; color:var(--muted); font-weight:500;
+                  text-transform:uppercase; font-size:10px; letter-spacing:.08em; }
+  table.dirs td.zone-CLEAR    { color:var(--muted); }
+  table.dirs td.zone-CAUTION  { color:var(--caution); }
+  table.dirs td.zone-WARNING  { color:var(--warn); }
+  table.dirs td.zone-DANGER   { color:var(--danger); }
+  table.dirs td.zone-CRITICAL { color:var(--critical); font-weight:600; }
+  table.dirs td.dim { color:var(--muted); }
+
+  .belt-row { display:flex; gap:18px; align-items:flex-start; }
+  .belt-block { flex:1; }
+  .belt-grid {
+    display:grid; grid-template-columns:repeat(3,minmax(0,1fr));
+    gap:4px; aspect-ratio:1; max-width:180px; margin:6px 0;
+  }
+  .belt-cell {
+    background:var(--el); border:1px solid var(--border); border-radius:6px;
+    aspect-ratio:1; display:flex; align-items:center; justify-content:center;
+    font-size:10px; color:var(--muted); position:relative;
+  }
+  .belt-cell.active {
+    background:var(--accent); color:#0e1218; border-color:var(--accent);
+    box-shadow:0 0 14px rgba(90,169,255,.5);
+  }
+  .belt-cell.active.head { background:var(--danger); border-color:var(--danger); }
+  .belt-cell.active.head.crit { background:var(--critical); border-color:var(--critical); }
+  .belt-cell .label { font-weight:600; font-size:11px; }
+  .belt-cell.center { background:transparent; border-style:dashed; }
+
+  .strip {
+    display:grid; grid-template-columns: 60px 1fr 1fr 1fr 1fr;
+    gap:0;
+    border:1px solid var(--border); border-radius:8px; overflow:hidden;
+    font-size:12px;
+  }
+  .strip > div {
+    padding:5px 8px; border-bottom:1px solid var(--border);
+  }
+  .strip > div:nth-child(-n+5) {
+    background:var(--el); color:var(--muted);
+    font-size:10px; text-transform:uppercase; letter-spacing:.08em;
+    border-bottom:1px solid var(--border);
+  }
+  .strip .row-now { background:rgba(90,169,255,.10); }
+  .strip .haz { font-weight:600; }
+  .strip .haz.WARNING  { color:var(--warn); }
+  .strip .haz.DANGER   { color:var(--danger); }
+  .strip .haz.CRITICAL { color:var(--critical); }
+  .strip .haz.CAUTION  { color:var(--caution); }
+
+  .small { font-size:11px; color:var(--muted); }
+  kbd { font-family: ui-monospace, monospace; background:var(--el);
+        padding:1px 6px; border:1px solid var(--border); border-radius:3px;
+        font-size:11px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>OmniSense — Second-Clock Monitor</h1>
+    <div class="subtitle">1&nbsp;Hz video-sync view: head + body, fused state, haptics</div>
+  </div>
+  <div id="demo-clock" class="demo-clock paused">
+    --:--<small>DEMO&nbsp;TIME</small>
+  </div>
+</header>
+
+<div class="replay-bar">
+  <div id="drop-zone" class="drop-zone">
+    Drop an <kbd>omnisense_*.log</kbd> here, or click to browse.
+    <input id="file-inp" type="file" accept=".log,.jsonl,text/plain"
+           style="display:none">
+  </div>
+  <div id="playback-wrap" style="display:none; flex:1; align-items:center; gap:10px;">
+    <button id="play-btn">▶ Play</button>
+    <input id="sec-slider" type="range" min="0" max="0" step="1" value="0">
+    <span id="sec-counter" class="info">0 / 0 s</span>
+    <button id="reset-btn">⟲ Reset</button>
+    <span class="info">Speed</span>
+    <select id="speed-sel">
+      <option value="0.5">0.5×</option>
+      <option value="1" selected>1×</option>
+      <option value="2">2×</option>
+      <option value="4">4×</option>
+    </select>
+  </div>
+  <span id="log-info" class="info"></span>
+</div>
+
+<main>
+
+  <div class="card full">
+    <div id="haz-banner" class="haz-banner">FUSED HAZARD: CLEAR</div>
+  </div>
+
+  <div class="card">
+    <h2>Radars (latest readings at this second)</h2>
+    <div class="radars">
+      <div class="radar-wrap">
+        <h3>BODY radar (8 ToFs + mmWave)</h3>
+        <canvas id="radar-body" class="radar" width="320" height="320"></canvas>
+      </div>
+      <div class="radar-wrap">
+        <h3>HEAD radar (front 5 ToFs + head mmWave)</h3>
+        <canvas id="radar-head" class="radar" width="320" height="320"></canvas>
+      </div>
+    </div>
+    <div class="small" id="radar-legend" style="margin-top:6px;">
+      Cone shading shows fused zone (WARNING / DANGER / CRITICAL). Distances
+      label only when each module's own ToF actually returned a reading.
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Per-direction state</h2>
+    <table class="dirs">
+      <thead><tr>
+        <th>Dir</th><th>Body ToF</th><th>Head ToF</th><th>Fused (m)</th>
+        <th>Source</th><th>Zone</th>
+      </tr></thead>
+      <tbody id="dirs-table"></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Body navigation belt</h2>
+    <div class="belt-row">
+      <div class="belt-block">
+        <div id="belt-grid" class="belt-grid"></div>
+        <div id="belt-text" class="small">cmd=stop motor=-1 intensity=0</div>
+      </div>
+      <div class="belt-block">
+        <div class="small" style="margin-bottom:6px;">
+          The belt fires the motor that points toward the next destination
+          relative to the user's current heading. <b>front_left</b> means
+          "drift slightly left to stay on the route".
+        </div>
+        <div id="belt-instr" class="small"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Head haptic ring</h2>
+    <div class="belt-row">
+      <div class="belt-block">
+        <div id="head-grid" class="belt-grid"></div>
+        <div id="head-text" class="small">no active haptic motors</div>
+      </div>
+      <div class="belt-block">
+        <div class="small">
+          Each motor on the head ring fires for the matching cardinal
+          direction whenever the FUSED hazard in that direction is at
+          WARNING or worse. The head ring shows what the user feels in
+          real time -- it covers all 8 directions even if the head's own
+          ToFs only physically see the front semicircle (back-zone
+          alerts come from the body ToFs via fusion).
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card full">
+    <h2>Per-second timeline (most recent)</h2>
+    <div id="strip" class="strip">
+      <div>Time</div><div>Fused hazard</div><div>Worst dir</div>
+      <div>Belt cmd</div><div>Head ring</div>
+    </div>
+  </div>
+
+</main>
+
+<script src="log_replay.js"></script>
+<script>
+const DIRS  = ["front", "front_right", "right", "back_right",
+               "back",  "back_left",   "left",  "front_left"];
+// Layout for the 3x3 belt grid (motor index -> [col,row], 0-based).
+const BELT_GRID_POS = {
+  front:       [1, 0], front_right: [2, 0], right:       [2, 1],
+  back_right:  [2, 2], back:        [1, 2], back_left:   [0, 2],
+  left:        [0, 1], front_left:  [0, 0],
+};
+const ZONE_COLOR = {
+  CLEAR:    "#7a8699",
+  CAUTION:  "#3498db",
+  WARNING:  "#f1c40f",
+  DANGER:   "#e67e22",
+  CRITICAL: "#e74c3c",
+};
+const ZONE_INTENSITY = { CLEAR:0, CAUTION:0.25, WARNING:0.5, DANGER:0.8, CRITICAL:1.0 };
+
+// ── Per-second aggregator ───────────────────────────────────────────────────
+//
+// Walk *all* frames once, group them by integer demo-second, and for each
+// second record the last body/head/fused snapshot we observed within that
+// window. Once aggregated we never re-parse; playback just indexes into
+// `secStates` by elapsed seconds, which is exactly the "1 Hz tick-locked
+// to demo time" guarantee the user asked for.
+let secStates = [];   // [{ sec, body, head, fused, hazard, motors, navMotor }]
+let secByIdx  = new Map();
+let logT0Ms   = 0;
+
+function tsToMs(ts){
+  if(!ts) return 0;
+  const m = ts.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})\.(\d{3})/);
+  if(!m) return 0;
+  return Date.UTC(+m[1], +m[2]-1, +m[3], +m[4], +m[5], +m[6], +m[7]);
+}
+
+function buildSecondStates(frames){
+  if(!frames.length){ secStates = []; secByIdx = new Map(); return; }
+  logT0Ms = tsToMs(frames[0].timestamp);
+  const lastDuration = tsToMs(frames[frames.length-1].timestamp) - logT0Ms;
+  const totalSec = Math.max(1, Math.ceil(lastDuration / 1000));
+  // Pre-create entries so playing past the last frame still gives a state.
+  secStates = Array.from({length: totalSec + 1}, (_, sec) => ({
+    sec,
+    body:  { tof:{}, mmwave:{}, imu:{} },
+    head:  { tof:{}, mmwave:{}, imu:{} },
+    fused: {},
+    hazard:{ level:0, label:"CLEAR", alerts:[] },
+    motors:[],          // head ring active motor list
+    navMotor:{ command:"front", motor_id:0, intensity:0,
+               instruction:"", phase:"idle", active:false },
+  }));
+  // Fill: for every frame, stamp it onto the second it lands in. Later
+  // frames overwrite earlier ones in the same second so we always have
+  // the *most recent* state at the second boundary.
+  let cur = secStates[0];
+  for(const f of frames){
+    const sec = Math.max(0, Math.floor((tsToMs(f.timestamp) - logT0Ms)/1000));
+    if(sec >= secStates.length) break;
+    const s = secStates[sec];
+    if(f.module === "body"){
+      s.body  = { tof: f.tof_body, mmwave: f.mmwave_body, imu: f.imu_body };
+      s.navMotor = f.nav_motor || s.navMotor;
+    } else {
+      s.head  = { tof: f.tof_head, mmwave: f.mmwave_head, imu: f.imu_head };
+      s.motors = f.motors || s.motors;
+    }
+    s.fused  = f.fused  || s.fused;
+    s.hazard = f.hazard || s.hazard;
+    s.timestamp = f.timestamp;
+  }
+  // Forward-fill: any second without its own packet inherits the previous
+  // second's state, so the dashboard never renders empty between ticks.
+  let prev = secStates[0];
+  for(const s of secStates){
+    if(!s.timestamp){
+      s.body     = prev.body;
+      s.head     = prev.head;
+      s.fused    = prev.fused;
+      s.hazard   = prev.hazard;
+      s.motors   = prev.motors;
+      s.navMotor = prev.navMotor;
+      s.timestamp = prev.timestamp;
+    }
+    prev = s;
+  }
+  secByIdx = new Map(secStates.map(s => [s.sec, s]));
+}
+
+// ── Render ──────────────────────────────────────────────────────────────────
+function fmtClock(sec){
+  if(!Number.isFinite(sec)) return "--:--";
+  const m = Math.floor(sec/60), s = Math.floor(sec%60);
+  return `${m}:${String(s).padStart(2,"0")}`;
+}
+
+function renderSecond(sec, isPaused){
+  const s = secByIdx.get(sec) || secStates[Math.max(0, Math.min(sec, secStates.length-1))]
+            || null;
+  if(!s) return;
+  // Clock
+  const clock = document.getElementById("demo-clock");
+  clock.firstChild.nodeValue = fmtClock(sec);
+  clock.classList.toggle("paused", !!isPaused);
+  // Hazard banner
+  const hb = document.getElementById("haz-banner");
+  hb.className = "haz-banner " + (s.hazard?.label || "CLEAR");
+  const acount = (s.hazard?.alerts || []).length;
+  hb.textContent = `FUSED HAZARD: ${s.hazard?.label || "CLEAR"}`
+                + (acount > 0 ? `  · ${acount} alert${acount>1?"s":""}` : "");
+  // Radars
+  drawRadar("radar-body", s.body?.tof || {}, s.fused, /*isHead=*/false);
+  drawRadar("radar-head", s.head?.tof || {}, s.fused, /*isHead=*/true);
+  // Per-direction table
+  drawDirsTable(s);
+  // Belt
+  drawBelt(s.navMotor || {});
+  // Head ring
+  drawHeadRing(s.motors || [], s.fused || {});
+  // Strip
+  drawStrip(sec);
+}
+
+// Eight equal-angle cones, north-up, drawn as pie wedges.
+function drawRadar(canvasId, ownTof, fused, isHead){
+  const c = document.getElementById(canvasId);
+  if(!c) return;
+  const ctx = c.getContext("2d");
+  const W = c.width, H = c.height;
+  ctx.clearRect(0,0,W,H);
+  const cx = W/2, cy = H/2, R = Math.min(W,H)/2 - 8;
+
+  // Background rings
+  ctx.strokeStyle = "#2a323e";
+  ctx.lineWidth = 1;
+  for(const frac of [0.33, 0.66, 1.0]){
+    ctx.beginPath();
+    ctx.arc(cx, cy, R*frac, 0, Math.PI*2);
+    ctx.stroke();
+  }
+  // Cones
+  const TWO_PI = Math.PI*2;
+  for(let i=0;i<DIRS.length;i++){
+    const dir   = DIRS[i];
+    const fz    = fused?.[dir];
+    const own   = ownTof?.[dir];
+    const zone  = fz?.zone || "CLEAR";
+    const inten = ZONE_INTENSITY[zone] ?? 0;
+    if(zone === "CLEAR" && (own == null)) continue;
+    const angle = (i/DIRS.length) * TWO_PI - Math.PI/2;
+    const half  = TWO_PI / DIRS.length / 2;
+    const a0 = angle - half, a1 = angle + half;
+    // Distance: use own ToF if present, else fused
+    const dist = (own != null) ? own
+              : (fz && fz.dist_m != null ? fz.dist_m : 2.0);
+    const rad = R * Math.max(0.18, Math.min(1.0, 1 - Math.min(2.0, dist)/2.0));
+    const color = ZONE_COLOR[zone] || ZONE_COLOR.CLEAR;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, rad, a0, a1);
+    ctx.closePath();
+    ctx.globalAlpha = 0.18 + 0.55 * inten;
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    // Label only when this module's own ToF actually returned a reading.
+    if(own != null){
+      const lx = cx + Math.cos(angle) * (rad + 14);
+      const ly = cy + Math.sin(angle) * (rad + 14);
+      ctx.fillStyle = "#e9eef5";
+      ctx.font = "11px ui-monospace, Menlo, monospace";
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(`${own.toFixed(2)}m`, lx, ly);
+    }
+  }
+  // North arrow
+  ctx.fillStyle = "#7a8699";
+  ctx.font = "10px system-ui";
+  ctx.textAlign = "center";
+  ctx.fillText("FRONT", cx, 12);
+}
+
+function drawDirsTable(s){
+  const tb = document.getElementById("dirs-table");
+  tb.innerHTML = "";
+  for(const d of DIRS){
+    const tr = document.createElement("tr");
+    const bv = s.body?.tof?.[d];
+    const hv = s.head?.tof?.[d];
+    const fz = s.fused?.[d];
+    const dist = (fz && fz.dist_m != null) ? fz.dist_m.toFixed(2)+"m" : "—";
+    const src  = fz?.source ?? "—";
+    const zone = fz?.zone   ?? "CLEAR";
+    tr.innerHTML =
+      `<td>${d}</td>`+
+      `<td class="${bv==null?'dim':''}">${bv==null?"—":bv.toFixed(2)+"m"}</td>`+
+      `<td class="${hv==null?'dim':''}">${hv==null?"—":hv.toFixed(2)+"m"}</td>`+
+      `<td>${dist}</td>`+
+      `<td class="${src==='none'?'dim':''}">${src}</td>`+
+      `<td class="zone-${zone}">${zone}</td>`;
+    tb.appendChild(tr);
+  }
+}
+
+function drawBelt(nav){
+  const grid = document.getElementById("belt-grid");
+  if(!grid.children.length){
+    // Build 3x3 grid once
+    for(let r=0;r<3;r++){
+      for(let c=0;c<3;c++){
+        const el = document.createElement("div");
+        el.className = "belt-cell" + (r===1 && c===1 ? " center" : "");
+        const dir = Object.keys(BELT_GRID_POS).find(d => {
+          const [cc,rr] = BELT_GRID_POS[d]; return cc===c && rr===r;
+        });
+        if(dir){ el.dataset.dir = dir; el.innerHTML = `<span class="label">${dir}</span>`; }
+        else el.textContent = "user";
+        grid.appendChild(el);
+      }
+    }
+  }
+  // Highlight active motor
+  for(const cell of grid.children){
+    cell.classList.remove("active");
+    if(cell.dataset.dir && cell.dataset.dir === nav?.command){
+      cell.classList.add("active");
+    }
+  }
+  document.getElementById("belt-text").textContent =
+    `cmd=${nav?.command || "stop"}  motor=${nav?.motor_id ?? -1}  ` +
+    `intensity=${nav?.intensity || 0}`;
+  document.getElementById("belt-instr").textContent =
+    nav?.instruction ? `“${nav.instruction}” (${nav.phase || "execute"})` : "";
+}
+
+function drawHeadRing(motors, fused){
+  const grid = document.getElementById("head-grid");
+  if(!grid.children.length){
+    for(let r=0;r<3;r++){
+      for(let c=0;c<3;c++){
+        const el = document.createElement("div");
+        el.className = "belt-cell" + (r===1 && c===1 ? " center" : "");
+        const dir = Object.keys(BELT_GRID_POS).find(d => {
+          const [cc,rr] = BELT_GRID_POS[d]; return cc===c && rr===r;
+        });
+        if(dir){ el.dataset.dir = dir; el.innerHTML = `<span class="label">${dir}</span>`; }
+        else el.textContent = "head";
+        grid.appendChild(el);
+      }
+    }
+  }
+  // Build active set from motors list (driven by [VERIFY:MOTOR_CMD])
+  const active = new Map();
+  for(const m of (motors || [])){
+    if(m && m.active) active.set(m.direction, m);
+  }
+  let activeCount = 0;
+  for(const cell of grid.children){
+    cell.classList.remove("active", "head", "crit");
+    const dir = cell.dataset.dir;
+    if(!dir) continue;
+    const m = active.get(dir);
+    if(m){
+      activeCount++;
+      cell.classList.add("active", "head");
+      if(m.zone === "CRITICAL") cell.classList.add("crit");
+    }
+  }
+  document.getElementById("head-text").textContent = activeCount === 0
+    ? "no active haptic motors"
+    : `${activeCount} active: ` + Array.from(active.keys()).join(", ");
+}
+
+function drawStrip(sec){
+  const strip = document.getElementById("strip");
+  // Wipe any existing data rows and rebuild from a 12-second window
+  // ending at `sec` (one row per second, oldest at top).
+  while(strip.children.length > 5) strip.removeChild(strip.lastChild);
+  const win = 12;
+  const start = Math.max(0, sec - win + 1);
+  const tmp = document.createElement("template");
+  for(let t = start; t <= sec; t++){
+    const s = secByIdx.get(t);
+    if(!s) continue;
+    const haz = s.hazard?.label || "CLEAR";
+    const worst = pickWorst(s.fused);
+    const motorsActive = (s.motors || []).filter(m => m && m.active)
+                          .map(m => m.direction).join(",") || "—";
+    const rowCls = (t === sec) ? "row-now" : "";
+    tmp.innerHTML =
+      `<div class="${rowCls}">${fmtClock(t)}</div>` +
+      `<div class="${rowCls} haz ${haz}">${haz}</div>` +
+      `<div class="${rowCls}">${worst || "—"}</div>` +
+      `<div class="${rowCls}">${s.navMotor?.command || "stop"}</div>` +
+      `<div class="${rowCls}">${motorsActive}</div>`;
+    while(tmp.content.firstChild) strip.appendChild(tmp.content.firstChild);
+  }
+}
+
+function pickWorst(fused){
+  let worst = null, worstLevel = -1;
+  const order = ["CLEAR","CAUTION","WARNING","DANGER","CRITICAL"];
+  for(const d of DIRS){
+    const z = fused?.[d]?.zone;
+    const lvl = order.indexOf(z || "CLEAR");
+    if(lvl > worstLevel){ worstLevel = lvl; worst = d; }
+  }
+  return worstLevel > 0 ? worst : null;
+}
+
+// ── Playback (1 Hz, demo-time-locked) ──────────────────────────────────────
+const state = {
+  playing: false,
+  sec: 0,
+  speed: 1.0,
+  timer: null,
+  lastReal: 0,
+  fracMs: 0,
+};
+
+function setSec(sec, paused){
+  state.sec = Math.max(0, Math.min(sec, secStates.length - 1));
+  document.getElementById("sec-slider").value = state.sec;
+  document.getElementById("sec-counter").textContent =
+    `${state.sec} / ${secStates.length - 1} s`;
+  renderSecond(state.sec, paused);
+}
+
+function play(){
+  if(!secStates.length) return;
+  if(state.sec >= secStates.length - 1) state.sec = 0;
+  state.playing = true;
+  state.lastReal = performance.now();
+  state.fracMs = 0;
+  document.getElementById("play-btn").textContent = "⏸ Pause";
+  // Tick at 100 ms real time so the slider feels live, but only step the
+  // demo-second integer when fracMs accumulates past 1000 (× speed).
+  state.timer = setInterval(() => {
+    const now = performance.now();
+    const dt = now - state.lastReal; state.lastReal = now;
+    state.fracMs += dt * state.speed;
+    while(state.fracMs >= 1000){
+      state.fracMs -= 1000;
+      if(state.sec >= secStates.length - 1){
+        pause();
+        return;
+      }
+      setSec(state.sec + 1, /*paused=*/false);
+    }
+  }, 100);
+}
+function pause(){
+  state.playing = false;
+  document.getElementById("play-btn").textContent = "▶ Play";
+  if(state.timer){ clearInterval(state.timer); state.timer = null; }
+  setSec(state.sec, /*paused=*/true);
+}
+function toggle(){ state.playing ? pause() : play(); }
+
+// ── DOM wiring ──────────────────────────────────────────────────────────────
+function loadFile(file){
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    const text = e.target.result;
+    if(!window.OmniSenseLog){
+      document.getElementById("log-info").textContent = "log_replay.js missing";
+      return;
+    }
+    const frames = window.OmniSenseLog.parseOmnisenseLog(text);
+    buildSecondStates(frames);
+    const sl = document.getElementById("sec-slider");
+    sl.max = secStates.length - 1;
+    sl.value = 0;
+    document.getElementById("playback-wrap").style.display = "flex";
+    document.getElementById("drop-zone").style.display = "none";
+    document.getElementById("log-info").textContent =
+      `${frames.length} frames · ${secStates.length}s of demo · file: ${file.name}`;
+    setSec(0, /*paused=*/true);
+  };
+  reader.readAsText(file);
+}
+
+window.addEventListener("DOMContentLoaded", () => {
+  const fi = document.getElementById("file-inp");
+  fi.addEventListener("change", e => {
+    if(e.target.files && e.target.files[0]) loadFile(e.target.files[0]);
+  });
+  const dz = document.getElementById("drop-zone");
+  dz.addEventListener("click", () => fi.click());
+  dz.addEventListener("dragover", e => {
+    e.preventDefault(); dz.classList.add("drag-over");
+  });
+  dz.addEventListener("dragleave", () => dz.classList.remove("drag-over"));
+  dz.addEventListener("drop", e => {
+    e.preventDefault(); dz.classList.remove("drag-over");
+    const f = e.dataTransfer.files[0]; if(f) loadFile(f);
+  });
+  document.getElementById("play-btn").addEventListener("click", toggle);
+  document.getElementById("reset-btn").addEventListener("click", () => {
+    pause(); setSec(0, true);
+  });
+  document.getElementById("sec-slider").addEventListener("input", e => {
+    pause(); setSec(+e.target.value, true);
+  });
+  document.getElementById("speed-sel").addEventListener("change", e => {
+    state.speed = +e.target.value;
+  });
+  // Keyboard: space to play/pause, ← / → to step.
+  window.addEventListener("keydown", e => {
+    if(e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+    if(e.code === "Space"){ e.preventDefault(); toggle(); }
+    if(e.code === "ArrowLeft" && secStates.length){ pause(); setSec(state.sec - 1, true); }
+    if(e.code === "ArrowRight" && secStates.length){ pause(); setSec(state.sec + 1, true); }
+  });
+});
+</script>
+</body>
+</html>

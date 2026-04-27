@@ -137,6 +137,111 @@
       <p class="sim-hint">Uses test_server.py to simulate a moving walker without hardware.</p>
     </section>
 
+    <!-- ══════════ Log Replay (offline playback of recorded sessions) ══════════ -->
+    <style>
+      .replay-section { padding: 14px 16px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+      #replay-banner.replay-banner {
+        display:flex; align-items:center; gap:7px;
+        background: rgba(159, 122, 234, .12);
+        border: 1px solid #6b46c1;
+        border-radius: var(--radius-sm);
+        padding: 7px 10px; font-size: 12px; color: #c5a6ff;
+        margin-bottom: 10px;
+      }
+      #replay-banner.hidden { display:none; }
+      .btn-replay {
+        background: var(--bg-elevated); color: var(--text-muted);
+        border: 1px solid var(--border-light);
+        width:100%; font-size:12px; padding:8px 12px;
+        display:flex; align-items:center; gap:7px; justify-content:center;
+        border-radius: var(--radius-sm); cursor:pointer; transition:.15s;
+      }
+      .btn-replay:hover { background: var(--bg-hover); color: var(--text-primary); }
+      .btn-replay.active {
+        background: rgba(159, 122, 234, .15);
+        border-color: #6b46c1;
+        color: #c5a6ff;
+      }
+      .replay-drop {
+        margin-top: 10px;
+        border: 1.5px dashed var(--border-light);
+        border-radius: var(--radius-sm);
+        padding: 18px 12px;
+        text-align: center;
+        color: var(--text-muted);
+        font-size: 12px;
+        cursor: pointer;
+        transition: .15s;
+      }
+      .replay-drop.drag {
+        border-color: #6b46c1;
+        background: rgba(159, 122, 234, .08);
+        color: #c5a6ff;
+      }
+      .replay-drop:hover { border-color: var(--text-muted); color: var(--text-primary); }
+      .replay-controls { margin-top: 10px; display: none; }
+      .replay-controls.active { display: block; }
+      .replay-meta {
+        font-size: 11px; color: var(--text-muted);
+        margin-bottom: 6px; display:flex; justify-content:space-between;
+      }
+      #replay-slider {
+        width: 100%; -webkit-appearance: none; appearance: none;
+        height: 4px; background: var(--bg-elevated);
+        border-radius: 2px; outline: none;
+      }
+      #replay-slider::-webkit-slider-thumb {
+        -webkit-appearance: none; appearance: none;
+        width: 12px; height: 12px; border-radius: 50%;
+        background: #c5a6ff; cursor: pointer;
+      }
+      .replay-btns { display:flex; gap:6px; margin-top:8px; }
+      .replay-btns .btn {
+        flex:1; padding:6px 4px; font-size:11px;
+        background: var(--bg-elevated); border:1px solid var(--border-light);
+        color: var(--text-primary);
+      }
+      .replay-btns .btn:hover { background: var(--bg-hover); }
+      .replay-btns .btn.speed.active {
+        background: rgba(159,122,234,.15);
+        border-color:#6b46c1; color:#c5a6ff;
+      }
+      .replay-btns .btn.danger { color:#e05c5c; }
+    </style>
+
+    <section class="replay-section">
+      <button id="replay-mode-btn" class="btn btn-replay">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+        Enable Log Replay
+      </button>
+
+      <div id="replay-ui" style="display:none">
+        <div id="replay-drop" class="replay-drop">
+          <div>Drop an <code>omnisense_*.log</code> here</div>
+          <div style="margin-top:4px;opacity:.7">or click to browse</div>
+          <input id="replay-file" type="file" accept=".log,.txt" style="display:none"/>
+        </div>
+
+        <div id="replay-controls" class="replay-controls">
+          <div class="replay-meta">
+            <span id="replay-filename">—</span>
+            <span id="replay-time">0.0 s / 0.0 s</span>
+          </div>
+          <input id="replay-slider" type="range" min="0" max="1000" value="0"/>
+          <div class="replay-btns">
+            <button id="replay-play"  class="btn">Play</button>
+            <button id="replay-1x"    class="btn speed">1×</button>
+            <button id="replay-4x"    class="btn speed active">4×</button>
+            <button id="replay-10x"   class="btn speed">10×</button>
+            <button id="replay-clear" class="btn danger">×</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- Server connection -->
     <footer class="sidebar-footer">
       <div class="server-row">
@@ -206,7 +311,9 @@
     </div>
   </main>
 
+  <script src="log_replay.js"></script>
   <script src="app.js"></script>
+  <script src="app_replay.js"></script>
   <!-- Load Google Maps API asynchronously after app.js defines the callback -->
   <script>
     (function () {

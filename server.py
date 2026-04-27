@@ -119,6 +119,9 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
 from algorithm import (
+    DIRECTIONS,
+    TOF_MAX_RANGE_M,
+    _tof_subdict_to_raw_mm,
     process_combined_packet,
     print_decision,
     fresh_device_state,
@@ -139,6 +142,52 @@ _PROC_TIME_WARN_MS    = 100.0   # server processing share of the 200 ms budget
 _TIMEOUT_THRESHOLD_MS = 2000.0  # 2.2.5 R3 / 2.2.7 R2 – connection-loss window
 _RATE_MIN_HZ          = 9.0     # 2.2.5 R1 – 10 Hz ± 10 % lower bound
 _MODULE_STALE_MS      = 200.0   # 2.2.2 R4 – head/body exchange must be ≥ 10 Hz
+
+
+def _tof_sensors_to_metres_grid(tof_dict: dict | None) -> dict[str, float | None]:
+    """Convert raw ``tof_sensors`` → one entry per direction (metres or ``None``).
+
+    Firmware may omit directions or send ``{"direction": {}}`` when VL53L1X
+    has no valid sample.  The dashboard and JSON API must expose **explicit**
+    nulls for those directions so the UI does not keep showing distances from
+    an earlier packet (same for keys missing entirely after a sparse JSON).
+
+    Distance extraction matches ``algorithm._parse_tof_sensors`` (including the
+    40–4000 mm validity band and ``distance_mm`` preference over ``avg``).
+    """
+    out: dict[str, float | None] = {d: None for d in DIRECTIONS}
+    td = tof_dict or {}
+    for d in DIRECTIONS:
+        v = td.get(d)
+        raw_mm = _tof_subdict_to_raw_mm(v if isinstance(v, dict) else None)
+        if raw_mm is None:
+            out[d] = None
+            continue
+        dist_m = raw_mm / 1000.0
+        out[d] = (
+            round(dist_m, 4) if dist_m <= TOF_MAX_RANGE_M else None
+        )
+    return out
+
+
+def _strip_stale_sensors_for_fusion(pkt: dict, stale: bool) -> dict:
+    """Return a shallow copy with ToF/mmWave cleared when the packet is stale.
+
+    ``latest_module_data`` keeps the last JSON from each module between POSTs.
+    If only the body is online at 10 Hz while the head has been silent for
+    hundreds of ms, fusion must **not** keep merging the head's old ToF ranges
+    with the body's current readings (e.g. body reports ``back_right: {}`` but
+    the fused column still showed the head's obsolete ``back_right`` distance).
+
+    IMU, battery, and other fields are preserved so dashboards can still show
+    last-known orientation/power from the quiet module.
+    """
+    if not pkt or not stale:
+        return pkt
+    out = dict(pkt)
+    out["tof_sensors"] = {}
+    out["mmwave_sensors"] = {}
+    return out
 
 
 def _setup_logging(log_dir: str = _LOG_DIR) -> None:
@@ -415,7 +464,7 @@ def nav() -> tuple:
         if other_idle_ms > _MODULE_STALE_MS:
             logger.warning(
                 "│  [VERIFY:MODULE_STALE] other_module=%-4s idle_ms=%.1f  "
-                "threshold_ms=%.0f  ← fusion using stale %s data",
+                "threshold_ms=%.0f  ← ToF/mmWave from stale %s packet ignored in fusion",
                 other_module, other_idle_ms, _MODULE_STALE_MS, other_module,
             )
 
@@ -423,9 +472,22 @@ def nav() -> tuple:
     data["_server_recv_ms"] = now_ms          # internal timestamp for staleness check
     latest_module_data[module] = data
 
+    head_pkt_live = latest_module_data.get("head") or {}
+    body_pkt_live = latest_module_data.get("body") or {}
+    head_ts = float(head_pkt_live.get("_server_recv_ms", 0.0) or 0.0)
+    body_ts = float(body_pkt_live.get("_server_recv_ms", 0.0) or 0.0)
+    head_idle_ms = (now_ms - head_ts) if head_ts else float("inf")
+    body_idle_ms = (now_ms - body_ts) if body_ts else float("inf")
+    head_for_fusion = _strip_stale_sensors_for_fusion(
+        head_pkt_live, head_idle_ms > _MODULE_STALE_MS
+    )
+    body_for_fusion = _strip_stale_sensors_for_fusion(
+        body_pkt_live, body_idle_ms > _MODULE_STALE_MS
+    )
+
     result = process_combined_packet(
-        latest_module_data["head"],
-        latest_module_data["body"],
+        head_for_fusion,
+        body_for_fusion,
         combined_state,
         now_ms,
     )
@@ -522,16 +584,6 @@ def nav() -> tuple:
     head_pkt = latest_module_data.get("head", {})
     body_pkt = latest_module_data.get("body", {})
 
-    def _tof_to_m(tof_dict: dict) -> dict:
-        """Convert raw tof_sensors dict → {direction: dist_m | None}."""
-        out = {}
-        for d, v in tof_dict.items():
-            if not isinstance(v, dict):
-                out[d] = None; continue
-            raw = v.get("avg") or v.get("distance_mm")
-            out[d] = None if (raw is None or raw >= 8190 or raw <= 0) else round(raw / 1000.0, 4)
-        return out
-
     t = _device_timing.get(device_id, {})
     avg_interval = (t.get("interval_sum_ms", 0) / t["interval_count"]
                     if t.get("interval_count") else None)
@@ -574,8 +626,8 @@ def nav() -> tuple:
         "module":      module,
         "pkt_count":   device_state[device_id]["packet_count"] + 1,
         "timestamp":   now_ms,
-        "tof_body":    _tof_to_m(body_pkt.get("tof_sensors", {})),
-        "tof_head":    _tof_to_m(head_pkt.get("tof_sensors", {})),
+        "tof_body":    _tof_sensors_to_metres_grid(body_pkt.get("tof_sensors", {})),
+        "tof_head":    _tof_sensors_to_metres_grid(head_pkt.get("tof_sensors", {})),
         "mmwave_body": body_pkt.get("mmwave_sensors", {}),
         "mmwave_head": head_pkt.get("mmwave_sensors", {}),
         # Raw IMU block as the firmware sent it. Empty dict when the module
@@ -709,20 +761,8 @@ _MODULE_OFFLINE_MS = 2000   # treat module as offline after 2s of silence
 
 
 def _tof_dict_to_metres(tof_dict: dict) -> dict:
-    """Convert raw tof_sensors dict → {direction: dist_m | None}.
-
-    Mirrors the same filter used by the combined /sensor_state endpoint:
-    drop sentinel/over-range values (>= 8190 mm or <= 0).
-    """
-    out = {}
-    for d, v in tof_dict.items():
-        if not isinstance(v, dict):
-            out[d] = None
-            continue
-        raw = v.get("avg") or v.get("distance_mm")
-        out[d] = (None if (raw is None or raw >= 8190 or raw <= 0)
-                  else round(raw / 1000.0, 4))
-    return out
+    """Same as ``_tof_sensors_to_metres_grid`` (kept name for /sensor_state/<module>)."""
+    return _tof_sensors_to_metres_grid(tof_dict)
 
 
 def _per_module_snapshot(module: str) -> dict | None:
@@ -953,19 +993,23 @@ nav_state: dict[str, Any] = {
     "distance_m":  None,
     "phase":       "idle",    # idle | prepare | execute
     "active":      False,
+    "step_index":  0,
     "updated_at":  0.0,
 }
 
 route_state: dict[str, Any] = {
-    "origin":           None,
-    "destination":      None,
-    "dest_name":        "",
-    "steps":            [],
-    "step_index":       0,
-    "total_distance_m": 0,
-    "total_duration_s": 0,
-    "active":           False,
-    "updated_at":       0.0,
+    "origin":              None,
+    "destination":         None,
+    "dest_name":           "",
+    "steps":               [],
+    "step_index":          0,
+    "total_distance_m":    0,
+    "total_duration_s":    0,
+    "active":              False,
+    "updated_at":          0.0,
+    # Dense path + encoded overview from Google Directions (see /nav/set_route).
+    "path_coords":         [],
+    "overview_polyline":   None,
 }
 
 position_state: dict[str, Any] = {
@@ -1325,10 +1369,19 @@ def nav_set_command():
     # any stale tracker; for an actual turn it snapshots the start yaw.
     _start_turn_tracking(command)
 
+    step_index = data.get("step_index")
+    if step_index is not None:
+        try:
+            nav_state["step_index"] = int(step_index)
+        except (TypeError, ValueError):
+            pass
+
     nav_logger.info(
-        "[NAV:COMMAND] cmd=%s motor=%d intensity=%d dist=%s phase=%s instr=%r%s",
+        "[NAV:COMMAND] cmd=%s motor=%d intensity=%d dist=%s phase=%s step=%s instr=%r%s",
         command, nav_state["motor_id"], nav_state["intensity"],
-        nav_state["distance_m"], nav_state["phase"], nav_state["instruction"],
+        nav_state["distance_m"], nav_state["phase"],
+        nav_state.get("step_index", "?"),
+        nav_state["instruction"],
         f" (resolved_via_imu, delta={delta_deg:+.1f}°)" if resolved_via_imu else "",
     )
 
@@ -1372,21 +1425,67 @@ def nav_set_route():
     for server-side tracking and logging.
     """
     data = request.get_json(silent=True) or {}
-    route_state["origin"]           = data.get("origin")
-    route_state["destination"]      = data.get("destination")
-    route_state["dest_name"]        = str(data.get("dest_name", ""))
-    route_state["steps"]            = data.get("steps", [])
-    route_state["step_index"]       = 0
-    route_state["total_distance_m"] = float(data.get("total_distance_m", 0))
-    route_state["total_duration_s"] = float(data.get("total_duration_s", 0))
-    route_state["active"]           = bool(data.get("active", True))
-    route_state["updated_at"]       = time.time()
-
-    nav_logger.info(
-        "[NAV:ROUTE_SET] dest=%r total_m=%.0f steps=%d",
-        route_state["dest_name"], route_state["total_distance_m"],
-        len(route_state["steps"]),
+    route_state["origin"]             = data.get("origin")
+    route_state["destination"]        = data.get("destination")
+    route_state["dest_name"]          = str(data.get("dest_name", ""))
+    route_state["steps"]              = data.get("steps", [])
+    route_state["step_index"]         = 0
+    route_state["total_distance_m"]  = float(data.get("total_distance_m", 0))
+    route_state["total_duration_s"]  = float(data.get("total_duration_s", 0))
+    route_state["active"]            = bool(data.get("active", True))
+    route_state["updated_at"]        = time.time()
+    route_state["path_coords"]       = data.get("path_coords") or []
+    op = data.get("overview_polyline")
+    route_state["overview_polyline"] = (
+        op if isinstance(op, str) and op.strip()
+        else (op.get("points") if isinstance(op, dict) else None)
     )
+
+    n_path = len(route_state["path_coords"])
+    nav_logger.info(
+        "[NAV:ROUTE_SET] dest=%r total_m=%.0f steps=%d path_pts=%d",
+        route_state["dest_name"], route_state["total_distance_m"],
+        len(route_state["steps"]), n_path,
+    )
+    # Ordered vertices along the walking leg: leg start, then each step end
+    # (turn / segment boundary). Consecutive duplicates removed for readability.
+    try:
+        mpts: list[dict[str, float]] = []
+        for st in route_state["steps"]:
+            if not mpts:
+                mpts.append(
+                    {"lat": float(st["start_lat"]), "lng": float(st["start_lng"])}
+                )
+            nxt = {"lat": float(st["end_lat"]), "lng": float(st["end_lng"])}
+            if mpts[-1]["lat"] != nxt["lat"] or mpts[-1]["lng"] != nxt["lng"]:
+                mpts.append(nxt)
+        if mpts:
+            nav_logger.info(
+                "[NAV:WAYPOINT_MANEUVERS] %s",
+                json.dumps(mpts, separators=(",", ":")),
+            )
+    except (KeyError, TypeError, ValueError) as exc:
+        nav_logger.warning("[NAV:WAYPOINT_MANEUVERS] skip: %s", exc)
+
+    # Single-line JSON dump so the log replay engine can reconstruct the
+    # full route (origin, destination, polyline-able step list) without
+    # needing the original Google Directions response.
+    try:
+        detail: dict[str, Any] = {
+            "origin":           route_state["origin"],
+            "destination":      route_state["destination"],
+            "dest_name":        route_state["dest_name"],
+            "steps":            route_state["steps"],
+            "total_distance_m": route_state["total_distance_m"],
+            "total_duration_s": route_state["total_duration_s"],
+        }
+        if route_state["path_coords"]:
+            detail["path_coords"] = route_state["path_coords"]
+        if route_state.get("overview_polyline"):
+            detail["overview_polyline"] = route_state["overview_polyline"]
+        nav_logger.info("[NAV:ROUTE_DETAIL] %s", json.dumps(detail, separators=(",", ":")))
+    except (TypeError, ValueError) as exc:  # pragma: no cover — sanity guard
+        nav_logger.warning("[NAV:ROUTE_DETAIL] failed to serialize: %s", exc)
 
     # Reset nav command to straight ahead when a new route starts
     nav_state.update({
@@ -1460,6 +1559,21 @@ def nav_position():
     position_state["lng"]        = data.get("lng")
     position_state["heading"]    = data.get("heading")
     position_state["updated_at"] = time.time()
+
+    # Log every position update so the navigation log can be replayed with
+    # the user's path and heading reproduced on the map.
+    if position_state["lat"] is not None and position_state["lng"] is not None:
+        try:
+            nav_logger.debug(
+                "[NAV:POSITION] lat=%.6f lng=%.6f heading=%s",
+                float(position_state["lat"]),
+                float(position_state["lng"]),
+                ("%.1f" % float(position_state["heading"]))
+                  if position_state["heading"] is not None else "None",
+            )
+        except (TypeError, ValueError):
+            pass
+
     return jsonify({"status": "ok", "position": position_state, "nav": nav_state})
 
 
@@ -1506,6 +1620,19 @@ def dashboard_body():
     with body-side ToF / mmWave / IMU / battery telemetry.
     """
     return send_from_directory(_FRONTEND_DIR, "body_dashboard.html")
+
+
+@app.route("/dashboard/second")
+def dashboard_second():
+    """Serve the 1 Hz "second-clock" replay dashboard.
+
+    A static, drop-a-log-here page that is intended to be played back
+    side-by-side with a recorded demo video. Unlike the live head/body
+    dashboards (which render on every packet) this one ticks exactly
+    once per integer demo-second, so the on-screen state stays in
+    lock-step with whatever timecode the video editor lays down.
+    """
+    return send_from_directory(_FRONTEND_DIR, "second_dashboard.html")
 
 
 @app.route("/frontend/<path:filename>")

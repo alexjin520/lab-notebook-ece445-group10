@@ -246,6 +246,9 @@ input[type=range]{flex:1;accent-color:var(--accent)}
     <a class="tab" href="/dashboard/body"
        style="text-decoration:none;display:inline-flex;align-items:center"
        title="Open the body-only monitor in this tab">◉ Body</a>
+    <a class="tab" href="/dashboard/second"
+       style="text-decoration:none;display:inline-flex;align-items:center"
+       title="Open the 1 Hz demo replay (head + body in lock-step with video)">⏱ 1 Hz Demo</a>
   </div>
   <div class="hdr-right">
     <span class="conn-dot" id="cdot"></span>
@@ -532,11 +535,37 @@ function setConnStatus(s) {
 }
 
 // ─── Live polling ──────────────────────────────────────────────────────────────
+/** Clears live ToF / fused / motor panels when the server has no packet yet (204). */
+function liveEmptySensorPayload() {
+  const nullTof = {};
+  const fused = {};
+  DIRS.forEach(d => {
+    nullTof[d] = null;
+    fused[d] = { dist_m: null, zone: "CLEAR", source: "none" };
+  });
+  return {
+    status: "ok",
+    tof_body: { ...nullTof },
+    tof_head: { ...nullTof },
+    fused,
+    motors: [],
+    hazard: { level: 0, label: "CLEAR", alerts: [] },
+    mmwave_body: {}, mmwave_head: {},
+    imu_body: {}, imu_head: {},
+    turn_status: {}, orientation: {},
+    power: {},
+    pkt_rate_hz: null, latency_ms: null, proc_ms: null, pkt_count: null,
+  };
+}
+
 async function fetchLive() {
   if (!connected) return;
   try {
     const r = await fetch(`${serverUrl}/sensor_state`, {signal: AbortSignal.timeout(1000)});
-    if (r.status === 204) return; // no data yet
+    if (r.status === 204) {
+      renderAll(liveEmptySensorPayload(), "live");
+      return;
+    }
     if (!r.ok) throw new Error();
     const d = await r.json();
     if (d.status === "ok") renderAll(d, "live");
@@ -1150,7 +1179,7 @@ function parseFrame(block) {
 
     // IMU_READ
     if (line.includes("[VERIFY:IMU_READ]")) {
-      const m = line.match(/module=(\w+)\s+roll=\s*([-\d.]+)\s+pitch=\s*([-\d.]+)\s+yaw=\s*([-\d.]+)\s+accel_z=([\d.]+)/);
+      const m = line.match(/module=(\w+)\s+roll=\s*([-\d.]+)\s+pitch=\s*([-\d.]+)\s+yaw=\s*([-\d.]+)\s+accel_z=\s*([-\d.]+)/);
       if (m) {
         const mod = m[1];
         const imu = {roll_deg:+m[2],pitch_deg:+m[3],yaw_deg:+m[4],accel_z:+m[5]};
@@ -1301,9 +1330,10 @@ function fixTabLinks() {
   const isFlask = location.pathname.startsWith("/dashboard");
   if (isFlask) return;  // Flask routes already match the hrefs as-is.
   const map = {
-    "/dashboard":      "sensor_dashboard.html",
-    "/dashboard/head": "head_dashboard.html",
-    "/dashboard/body": "body_dashboard.html",
+    "/dashboard":        "sensor_dashboard.html",
+    "/dashboard/head":   "head_dashboard.html",
+    "/dashboard/body":   "body_dashboard.html",
+    "/dashboard/second": "second_dashboard.html",
   };
   document.querySelectorAll("a.tab").forEach(a => {
     const href = a.getAttribute("href");

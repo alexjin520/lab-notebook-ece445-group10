@@ -140,6 +140,53 @@ input[type=range]{flex:1;accent-color:var(--accent-head)}
   font-size:10px;font-weight:700}
 .target-pill.yes{background:rgba(224,124,60,.2);color:#e07c3c}
 .target-pill.no{background:rgba(46,54,80,.5);color:var(--muted)}
+
+/* ── Log replay toolbar ─────────────────────────────────────────── */
+.replay-section{padding:0 14px;display:none}
+.replay-section.active{display:block}
+.replay-card{background:var(--panel);border:1px solid var(--border);
+  border-radius:10px;padding:14px;margin-top:14px}
+.replay-card .card-title{font-size:10px;font-weight:700;text-transform:uppercase;
+  letter-spacing:1px;color:var(--muted);margin-bottom:10px;display:flex;
+  align-items:center;gap:8px}
+.replay-card .card-title .replay-pill{padding:2px 8px;border-radius:10px;
+  font-size:9px;background:rgba(230,168,23,.18);color:var(--warn);
+  border:1px solid var(--warn);letter-spacing:.5px}
+.drop-zone{border:2px dashed var(--borderl);border-radius:10px;padding:30px;
+  text-align:center;cursor:pointer;transition:.2s;background:var(--el);
+  color:var(--muted)}
+.drop-zone:hover,.drop-zone.drag-over{border-color:var(--accent-head);
+  color:var(--text);background:rgba(230,168,23,.08)}
+.drop-zone svg{margin-bottom:10px;opacity:.5}
+.drop-zone p{font-size:13px;margin-bottom:4px}
+.drop-zone span{font-size:11px}
+.playback-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  background:var(--el);border:1px solid var(--borderl);border-radius:8px;
+  padding:10px 14px}
+.playback-bar label{font-size:10px;color:var(--muted);text-transform:uppercase;
+  letter-spacing:.5px}
+#pkt-slider{flex:1;min-width:200px;accent-color:var(--accent-head)}
+#pkt-counter{font-size:12px;font-weight:600;color:var(--accent-head);
+  white-space:nowrap;font-family:monospace;min-width:140px}
+.speed-btns{display:flex;gap:4px}
+.sbtn{padding:3px 9px;border-radius:4px;font-size:11px;font-weight:600;
+  cursor:pointer;background:var(--el);border:1px solid var(--borderl);
+  color:var(--muted)}
+.sbtn.active{background:var(--accent-head);border-color:var(--accent-head);color:#0d1117}
+#log-info{font-size:11px;color:var(--muted);padding:0 2px}
+.btn-sm{padding:4px 10px;font-size:11px;font-weight:600;border-radius:4px;
+  cursor:pointer;background:var(--el);border:1px solid var(--borderl);
+  color:var(--text)}
+.btn-sm:hover{background:var(--hover)}
+.btn-danger{background:transparent;border:1px solid var(--danger);
+  color:var(--danger);padding:4px 10px;font-size:11px;font-weight:600;
+  border-radius:4px;cursor:pointer}
+.btn-danger:hover{background:rgba(224,92,92,.10)}
+.replay-banner{padding:6px 12px;border-radius:6px;font-size:11px;
+  font-weight:600;letter-spacing:.5px;margin-bottom:10px;text-align:center;
+  background:rgba(230,168,23,.10);color:var(--warn);
+  border:1px solid var(--warn);display:none}
+.replay-banner.active{display:block}
 </style>
 </head>
 <body>
@@ -149,9 +196,12 @@ input[type=range]{flex:1;accent-color:var(--accent-head)}
   <span class="module-pill">HEAD</span>
   <span class="subtitle">Hazard ring · 8 ToF · 2 mmWave · IMU · battery</span>
   <div class="tab-bar">
+    <button class="tab active" id="mode-live-btn" onclick="setMode('live')">⬤ Live</button>
+    <button class="tab" id="mode-log-btn" onclick="setMode('log')">📂 Log Replay</button>
     <a class="tab" href="/dashboard">⬢ Combined</a>
     <a class="tab active" href="/dashboard/head">◉ Head</a>
     <a class="tab" href="/dashboard/body">◉ Body</a>
+    <a class="tab" href="/dashboard/second">⏱ 1 Hz Demo</a>
   </div>
   <div class="hdr-right">
     <span class="conn-dot" id="cdot"></span>
@@ -160,6 +210,49 @@ input[type=range]{flex:1;accent-color:var(--accent-head)}
     <button class="btn btn-p" id="conn-btn" onclick="toggleConnect()">Connect</button>
   </div>
 </header>
+
+<!-- ══════════ LOG REPLAY TOOLBAR (toggled by Log/Live tabs) ══════════ -->
+<div id="replay-section" class="replay-section">
+  <div class="replay-card">
+    <div class="card-title">
+      Log Replay
+      <span class="replay-pill">offline · uses recorded log</span>
+    </div>
+
+    <div id="drop-zone" class="drop-zone">
+      <svg width="42" height="42" viewBox="0 0 24 24" fill="none"
+           stroke="currentColor" stroke-width="1.5">
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+        <polyline points="14 2 14 8 20 8"/>
+        <line x1="12" y1="18" x2="12" y2="12"/>
+        <polyline points="9 15 12 12 15 15"/>
+      </svg>
+      <p>Drop an <code>omnisense_*.log</code> file here, or click to browse</p>
+      <span>Only head-module packets in the log are replayed.</span>
+    </div>
+    <input id="file-inp" type="file" accept=".log,.txt" style="display:none"/>
+
+    <div id="playback-wrap" style="display:none">
+      <div class="playback-bar">
+        <span id="pkt-counter">PKT #0  (0/0)</span>
+        <input id="pkt-slider" type="range" min="0" value="0"/>
+        <button class="btn-sm" onclick="logReplay.stepBack()">◀</button>
+        <button class="btn-sm" id="play-btn" onclick="logReplay.toggle()">▶ Play</button>
+        <button class="btn-sm" onclick="logReplay.stepForward()">▶</button>
+        <label>Speed</label>
+        <div class="speed-btns">
+          <button class="sbtn" onclick="setReplaySpeed(1,this)">1×</button>
+          <button class="sbtn" onclick="setReplaySpeed(5,this)">5×</button>
+          <button class="sbtn active" onclick="setReplaySpeed(10,this)">10×</button>
+          <button class="sbtn" onclick="setReplaySpeed(30,this)">30×</button>
+        </div>
+        <span id="log-info"></span>
+        <button class="btn-danger" style="margin-left:auto"
+                onclick="logReplay.clear()">✕ Clear</button>
+      </div>
+    </div>
+  </div>
+</div>
 
 <div class="dashboard">
 
@@ -312,12 +405,44 @@ function setConnStatus(s){
 }
 
 // ─── Polling ───────────────────────────────────────────────────────────────
+function emptyHeadLivePayload(){
+  const tof = {}, fused = {};
+  DIRS.forEach(d => {
+    tof[d] = null;
+    fused[d] = { dist_m: null, zone: "CLEAR", source: "none" };
+  });
+  return {
+    status: "ok",
+    online: false,
+    device_id: null,
+    idle_since_ms: null,
+    packet_count: 0,
+    pkt_rate_hz: null,
+    latency_ms: null,
+    proc_avg_ms: null,
+    interval_min_ms: null,
+    interval_avg_ms: null,
+    interval_max_ms: null,
+    tof, fused,
+    motors: [],
+    hazard: { level: 0, label: "CLEAR", alerts: [] },
+    mmwave: {},
+    imu: {},
+    battery: {},
+    system: {},
+  };
+}
+
 async function fetchLive(){
   if(!connected) return;
   try{
     const r = await fetch(`${serverUrl}/sensor_state/head`,
                           {signal: AbortSignal.timeout(1000)});
-    if(r.status === 204){ setConnStatus("warn"); return; }
+    if(r.status === 204){
+      setConnStatus("warn");
+      renderAll(emptyHeadLivePayload());
+      return;
+    }
     if(!r.ok) throw new Error();
     const d = await r.json();
     if(d.status === "ok"){
@@ -631,12 +756,88 @@ function renderStats(d){
 function fixTabLinks(){
   const isFlask = location.pathname.startsWith("/dashboard");
   const map = isFlask
-    ? {"/dashboard":"/dashboard", "/dashboard/head":"/dashboard/head", "/dashboard/body":"/dashboard/body"}
-    : {"/dashboard":"sensor_dashboard.html", "/dashboard/head":"head_dashboard.html", "/dashboard/body":"body_dashboard.html"};
+    ? {"/dashboard":"/dashboard", "/dashboard/head":"/dashboard/head", "/dashboard/body":"/dashboard/body", "/dashboard/second":"/dashboard/second"}
+    : {"/dashboard":"sensor_dashboard.html", "/dashboard/head":"head_dashboard.html", "/dashboard/body":"body_dashboard.html", "/dashboard/second":"second_dashboard.html"};
   document.querySelectorAll("a.tab").forEach(a => {
     const href = a.getAttribute("href");
     if(map[href]) a.setAttribute("href", map[href]);
   });
+}
+
+// ─── Live / Log mode toggle + replay glue ───────────────────────────────
+let mode      = "live";    // "live" | "log"
+let logReplay = null;      // OmniSenseLog.LogReplay instance (lazy)
+
+function setMode(next){
+  if(next === mode) return;
+  mode = next;
+  const replaySec = document.getElementById("replay-section");
+  const banner    = document.getElementById("replay-banner");
+  const liveBtn   = document.getElementById("mode-live-btn");
+  const logBtn    = document.getElementById("mode-log-btn");
+  const connBtn   = document.getElementById("conn-btn");
+  const serverInp = document.getElementById("server-inp");
+
+  if(next === "log"){
+    if(connected) disconnect();
+    if(replaySec) replaySec.classList.add("active");
+    if(banner)    banner.classList.add("active");
+    if(liveBtn)   liveBtn.classList.remove("active");
+    if(logBtn)    logBtn.classList.add("active");
+    if(connBtn)   connBtn.disabled = true;
+    if(serverInp) serverInp.disabled = true;
+    setConnStatus("off");
+    document.getElementById("cstat").textContent = "Log replay";
+  } else {
+    if(replaySec) replaySec.classList.remove("active");
+    if(banner)    banner.classList.remove("active");
+    if(liveBtn)   liveBtn.classList.add("active");
+    if(logBtn)    logBtn.classList.remove("active");
+    if(connBtn)   connBtn.disabled = false;
+    if(serverInp) serverInp.disabled = false;
+    if(logReplay && logReplay.playing) logReplay.toggle();
+    if(location.protocol === "http:" || location.protocol === "https:"){
+      connect();
+    }
+  }
+}
+
+function setReplaySpeed(s, btn){
+  if(!logReplay) return;
+  logReplay.setSpeed(s);
+  document.querySelectorAll("#replay-section .sbtn")
+          .forEach(b => b.classList.remove("active"));
+  if(btn) btn.classList.add("active");
+}
+
+function initLogReplay(){
+  if(!window.OmniSenseLog){
+    console.warn("log_replay.js not loaded; replay disabled");
+    return;
+  }
+  logReplay = new window.OmniSenseLog.LogReplay({
+    module:         "head",
+    dropZoneId:     "drop-zone",
+    fileInputId:    "file-inp",
+    playbackWrapId: "playback-wrap",
+    sliderId:       "pkt-slider",
+    counterId:      "pkt-counter",
+    playBtnId:      "play-btn",
+    infoId:         "log-info",
+    projectFrame:   window.OmniSenseLog.projectHeadFrame,
+    renderFrame: (view) => { latest = view; renderAll(view); },
+  });
+}
+
+function loadLogReplayEngine(cb){
+  if(window.OmniSenseLog){ cb(); return; }
+  const isFlask = location.pathname.startsWith("/dashboard");
+  const src = isFlask ? "/frontend/log_replay.js" : "log_replay.js";
+  const s = document.createElement("script");
+  s.src = src;
+  s.onload  = cb;
+  s.onerror = () => console.warn("Could not load log_replay.js from", src);
+  document.head.appendChild(s);
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────
@@ -648,6 +849,7 @@ window.addEventListener("DOMContentLoaded", () => {
   inp.value = `http://${location.hostname || "localhost"}:5000`;
   drawRadar({}, {});
   drawMotorRing([]);
+  loadLogReplayEngine(initLogReplay);
   // Auto-connect when served by the Flask app.
   if(location.protocol === "http:" || location.protocol === "https:"){
     connect();
