@@ -1128,16 +1128,35 @@ function parseLogFile(text) {
       }
     }
   }
+
+  // Forward-fill the IMU snapshots so the body IMU panel doesn't blink
+  // out on every other frame (head packets in this build don't carry an
+  // IMU_READ line). A module that *never* reports an IMU stays empty,
+  // which is what triggers the "No IMU on this module" placeholder.
+  let lastBody = null;
+  let lastHead = null;
+  for (const f of frames) {
+    if (Object.keys(f.imu_body).length > 0)       lastBody = f.imu_body;
+    else if (lastBody)                            f.imu_body = lastBody;
+    if (Object.keys(f.imu_head).length > 0)       lastHead = f.imu_head;
+    else if (lastHead)                            f.imu_head = lastHead;
+  }
   return frames;
 }
 
 function parseFrame(block) {
+  // Note: IMU defaults are EMPTY ({}) -- a frame with no IMU_READ should
+  // render as "No IMU on this module" (renderImu's empty-state branch),
+  // not as a phantom 0/0/0 reading. The forward-fill pass after parsing
+  // all blocks (see parseLogFile) is responsible for carrying the last
+  // observed body-IMU snapshot through subsequent head packets so the
+  // body IMU panel doesn't flicker every other frame.
   const frame = {
     pkt: block.pkt, device: block.device,
     tof_body: {}, tof_head: {},
     mmwave_body: {}, mmwave_head: {},
-    imu_head: {roll_deg:0,pitch_deg:0,yaw_deg:0,accel_z:9.81},
-    imu_body: {roll_deg:0,pitch_deg:0,yaw_deg:0,accel_z:9.81},
+    imu_head: {},
+    imu_body: {},
     fused: {}, motors: [],
     hazard: {level:0, label:"CLEAR", alerts:[]},
     power: {}, pkt_rate_hz: null, proc_ms: null, latency_ms: null,
@@ -1250,8 +1269,10 @@ function parseFrame(block) {
       if (m) frame.proc_ms = +m[1];
     }
 
-    // LATENCY_WARN
-    if (line.includes("[VERIFY:LATENCY_WARN]")) {
+    // LATENCY_WARN / LATENCY_INFO -- both carry the same e2e latency in ms,
+    // _WARN is emitted when the figure exceeds the budget, _INFO otherwise.
+    if (line.includes("[VERIFY:LATENCY_WARN]") ||
+        line.includes("[VERIFY:LATENCY_INFO]")) {
       const m = line.match(/latency_ms=([\d.]+)/);
       if (m) frame.latency_ms = +m[1];
     }

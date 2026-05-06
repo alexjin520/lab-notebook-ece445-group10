@@ -375,6 +375,89 @@ static void updateHaptics() {
   muxSelectDrv(0xFF);
 }
 
+// ── Navigation belt motor ────────────────────────────────────────────
+// The body module owns the *navigation* belt (one motor at a time, vibrating
+// in the direction the user should turn). It is independent of the hazard
+// haptic ring (updateHaptics, currently disabled).
+//
+// State is updated by sendNavData() each time the server responds to a /nav
+// POST -- the response carries a "nav_motor" JSON object with the resolved
+// command + motor_id + intensity + pattern. updateNavBeltMotor() runs every
+// loop() iteration and (a) PWM-modulates the chosen motor according to the
+// requested pattern and (b) keeps every other motor silent so no stale hum
+// leaks through when the command changes.
+struct NavMotorState {
+  int8_t   motor_id;       // 0-7 = belt slot, -1 = stop / silence everything
+  uint8_t  rtp_target;     // 0-127, peak RTP value when in the "on" phase
+  uint8_t  pattern_id;     // 0=off, 1=slow_pulse, 2=medium_pulse, 3=rapid_pulse
+  bool     active;
+  uint32_t phase_start_ms; // millis() when current pulse cycle started
+  uint32_t updated_ms;     // millis() of last server update (for safety timeout)
+};
+static NavMotorState navMotor = { -1, 0, 0, false, 0, 0 };
+
+// Hard safety: if no fresh /nav response arrives for this long, stop driving
+// the belt. Prevents a dropped WiFi connection from leaving a motor buzzing.
+#define NAV_BELT_FRESHNESS_MS 2000
+
+static uint8_t navPatternId(const char* p) {
+  if (!p) return 0;
+  if (strcmp(p, "slow_pulse")   == 0) return 1;
+  if (strcmp(p, "medium_pulse") == 0) return 2;
+  if (strcmp(p, "rapid_pulse")  == 0) return 3;
+  return 0;  // "off" or unknown
+}
+
+// Pulse cadence per pattern: returns (on_ms, off_ms). 0/0 = continuous.
+static void navPatternTiming(uint8_t id, uint32_t& on_ms, uint32_t& off_ms) {
+  switch (id) {
+    case 1: on_ms = 350; off_ms = 350; break;  // slow_pulse  ~1.4 Hz
+    case 2: on_ms = 200; off_ms = 200; break;  // medium_pulse ~2.5 Hz
+    case 3: on_ms = 100; off_ms = 100; break;  // rapid_pulse  ~5 Hz
+    default: on_ms = 0; off_ms = 0; break;     // off / continuous
+  }
+}
+
+// Drive exactly the requested belt motor; silence the other seven.
+static void updateNavBeltMotor() {
+  uint32_t now = millis();
+
+  // Safety timeout — if the server stopped talking, silence the belt.
+  bool stale = navMotor.updated_ms == 0 ||
+               (uint32_t)(now - navMotor.updated_ms) > NAV_BELT_FRESHNESS_MS;
+
+  // Decide whether the chosen motor should be in its "on" phase right now.
+  bool wantOn = false;
+  if (!stale && navMotor.active &&
+      navMotor.motor_id >= 0 && navMotor.motor_id < 8 &&
+      navMotor.rtp_target > 0) {
+    uint32_t on_ms, off_ms;
+    navPatternTiming(navMotor.pattern_id, on_ms, off_ms);
+    if (on_ms == 0 && off_ms == 0) {
+      wantOn = true;  // continuous
+    } else {
+      uint32_t cycle = on_ms + off_ms;
+      uint32_t t     = (now - navMotor.phase_start_ms) % cycle;
+      wantOn = (t < on_ms);
+    }
+  }
+
+  // Apply: only the active motor gets non-zero RTP.
+  bool muxTouched = false;
+  for (uint8_t i = 0; i < 8; i++) {
+    if (!drvs[i].present) continue;
+    uint8_t target = ((int8_t)i == navMotor.motor_id && wantOn)
+                       ? navMotor.rtp_target : 0;
+    if (target == drvs[i].rtp) continue;   // skip redundant I2C write
+    drvs[i].rtp = target;
+    muxSelectDrv(drvs[i].mux_ch);
+    delayMicroseconds(200);
+    drvDev[i].setRealtimeValue(target);
+    muxTouched = true;
+  }
+  if (muxTouched) muxSelectDrv(0xFF);
+}
+
 // ── ToF initialisation — called once from setup() ────────────────────────────
 static void initToFSensors() {
   Wire.beginTransmission(MUX_ADDR);
@@ -921,6 +1004,9 @@ static void sendNavData(float voltage, float soc, float tempC, uint32_t freeHeap
         Serial.print(" (level="); Serial.print(hazardLevel); Serial.println(")");
 
         // ── Motor commands from server (print only) ──────────────────────
+        // The "motors" array (8 entries) is the *hazard* haptic state,
+        // owned by the head module. The body module logs it for context
+        // but does not drive any motors from it.
         JsonArray motors = resp_doc["motors"].as<JsonArray>();
         for (JsonObject m : motors) {
           const char* dir     = m["direction"] | "?";
@@ -933,6 +1019,57 @@ static void sendNavData(float voltage, float soc, float tempC, uint32_t freeHeap
           Serial.print(" intensity="); Serial.print(intens);
           Serial.print(" zone="); Serial.print(zone);
           if (dist_m >= 0) { Serial.print(" dist="); Serial.print(dist_m, 3); Serial.print("m"); }
+          Serial.println();
+        }
+
+        // ── Navigation belt motor (BODY module) ──────────────────────────
+        // The server returns the resolved nav-belt command in nav_motor.
+        // We translate it into RTP + pattern state and let
+        // updateNavBeltMotor() drive the DRV2605 every loop tick.
+        JsonObject nm = resp_doc["nav_motor"].as<JsonObject>();
+        if (!nm.isNull()) {
+          const char* cmd       = nm["command"]    | "stop";
+          int         motorId   = nm["motor_id"]   | -1;
+          int         intensity = nm["intensity"]  | 0;       // 0-204 server scale
+          const char* pattern   = nm["pattern"]    | "off";
+          bool        active    = nm["active"]     | false;
+          const char* instr     = nm["instruction"]| "";
+          float       distM     = nm["distance_m"] | -1.0f;
+
+          // Server uses a 0-255 PWM scale (max ≈ 204). Compress to the
+          // DRV2605 RTP range 0-127 so "back" (204) maps to max buzz.
+          int rtpScaled = (intensity * 127) / 204;
+          if (rtpScaled < 0)   rtpScaled = 0;
+          if (rtpScaled > 127) rtpScaled = 127;
+          uint8_t rtp = (uint8_t)rtpScaled;
+
+          uint8_t patId = navPatternId(pattern);
+
+          // If the command/pattern/motor changed, restart the pulse cycle
+          // from the "on" phase so the user feels the new cue immediately.
+          if (motorId != navMotor.motor_id ||
+              patId   != navMotor.pattern_id ||
+              active  != navMotor.active) {
+            navMotor.phase_start_ms = millis();
+          }
+          navMotor.motor_id    = (int8_t)constrain(motorId, -1, 7);
+          navMotor.rtp_target  = rtp;
+          navMotor.pattern_id  = patId;
+          navMotor.active      = active;
+          navMotor.updated_ms  = millis();
+
+          // Drive the belt right now so the user feels the new command on
+          // the same loop tick the response landed.
+          updateNavBeltMotor();
+
+          Serial.print("[NAV]  belt cmd=");      Serial.print(cmd);
+          Serial.print(" motor=");               Serial.print(motorId);
+          Serial.print(" intensity=");           Serial.print(intensity);
+          Serial.print(" rtp=");                 Serial.print(rtp);
+          Serial.print(" pattern=");             Serial.print(pattern);
+          Serial.print(" active=");              Serial.print(active ? "Y" : "N");
+          if (distM >= 0) { Serial.print(" dist="); Serial.print(distM, 1); Serial.print("m"); }
+          if (instr && *instr) { Serial.print(" instr=\""); Serial.print(instr); Serial.print("\""); }
           Serial.println();
         }
 
@@ -1251,7 +1388,13 @@ void loop() {
   readIMUOnce();
 
   // ── Update haptic motors from latest ToF readings ── DISABLED ────────
+  // The hazard haptic ring is driven by the HEAD module, not the body.
   // updateHaptics();
+
+  // ── Drive the navigation belt motor (single motor, per-pattern PWM) ──
+  // navMotor state is refreshed by sendNavData() each /nav cycle; this
+  // keeps the chosen motor pulsing at the right cadence between updates.
+  updateNavBeltMotor();
 
   // ── HTTP POST at 10 Hz ────────────────────────────────────────────────────
   static unsigned long lastPost = 0;
