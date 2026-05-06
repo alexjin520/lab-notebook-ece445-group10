@@ -25,6 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 
+import algorithm
+
 from algorithm import (
     DIRECTIONS,
     NUM_DIRECTIONS,
@@ -43,6 +45,7 @@ from algorithm import (
     _parse_mmwave_sensors,
     _parse_imu,
     _fuse_sensor_data,
+    _merge_fused_dicts,
     _apply_imu_compensation,
     _generate_motor_commands,
     _compute_hazard,
@@ -197,10 +200,10 @@ class TestParseTofSensors:
         assert result["front"] is None
 
     def test_at_tof_max_range_accepted(self):
-        # exactly 5 m = 5000 mm → 5.0 m == TOF_MAX_RANGE_M is still accepted
-        data = {"front": {"distance_mm": 5000, "avg": 5000}}
+        # 4000 mm is the upper firmware-valid VL53 band; still within TOF_MAX_RANGE_M
+        data = {"front": {"distance_mm": 4000, "avg": 4000}}
         result = _parse_tof_sensors(data)
-        assert result["front"] == pytest.approx(5.0)
+        assert result["front"] == pytest.approx(4.0)
 
     def test_missing_direction_returns_none(self):
         result = _parse_tof_sensors({})
@@ -211,6 +214,27 @@ class TestParseTofSensors:
         data = {"front": {"distance_mm": 0, "avg": 0}}
         result = _parse_tof_sensors(data)
         assert result["front"] is None
+
+    def test_empty_object_reading_returns_none(self):
+        """Firmware sends ``{}`` when VL53L1X has no valid sample for that direction."""
+        data = {"back_right": {}}
+        result = _parse_tof_sensors(data)
+        assert result["back_right"] is None
+
+    def test_non_dict_reading_returns_none(self):
+        data = {"left": "bogus"}
+        result = _parse_tof_sensors(data)
+        assert result["left"] is None
+
+    def test_below_min_valid_mm_rejected(self):
+        data = {"front": {"distance_mm": 25, "avg": 25}}
+        result = _parse_tof_sensors(data)
+        assert result["front"] is None
+
+    def test_falls_back_to_avg_when_distance_mm_out_of_band(self):
+        data = {"front": {"distance_mm": 3, "avg": 1500}}
+        result = _parse_tof_sensors(data)
+        assert result["front"] == pytest.approx(1.5)
 
     def test_partial_directions(self):
         data = {"front": {"distance_mm": 800, "avg": 800}}
@@ -344,6 +368,15 @@ class TestFuseSensorData:
         fused = _fuse_sensor_data(tof, mmwave)
         assert fused["left"]["zone"]  == Zone.CLEAR  # no ToF, no mmWave coverage
         assert fused["right"]["zone"] == Zone.CLEAR
+
+    def test_merge_head_body_both_clear_source_none(self):
+        """Cross-module merge must not invent a ``tof`` source when both sides are empty."""
+        head_f = _fuse_sensor_data(_empty_tof(), _empty_mmwave(), module="head")
+        body_f = _fuse_sensor_data(_empty_tof(), _empty_mmwave(), module="body")
+        merged = _merge_fused_dicts(head_f, body_f)
+        for d in DIRECTIONS:
+            assert merged[d]["distance_m"] is None
+            assert merged[d]["source"] == "none"
 
     # ── mmWave-only scenarios (ToF clear, beyond 5 m) ─────────────────────
 
@@ -740,7 +773,9 @@ class TestProcessPacket:
         assert motor_front["distance_m"] == pytest.approx(0.5)
         assert motor_front["source"]     == "tof+mmwave"
 
-    def test_imu_tilt_suppresses_channels(self):
+    def test_imu_tilt_suppresses_channels(self, monkeypatch):
+        # Tilt suppression is off in production builds; enable for this test only.
+        monkeypatch.setattr(algorithm, "IMU_TILT_SUPPRESS_ENABLED", True)
         pkt = _make_full_packet()
         pkt["tof_sensors"]["front"] = {
             "distance_mm": 800, "avg": 800, "min": 780, "max": 820, "count": 50

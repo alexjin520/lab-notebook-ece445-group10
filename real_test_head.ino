@@ -6,13 +6,12 @@
 #include <time.h>               // POSIX time — used for NTP Unix timestamp
 #include <Adafruit_VL53L1X.h>    // VL53L1X 4m ToF distance sensor
 #include <Adafruit_DRV2605.h>    // DRV2605L haptic motor driver
-#include "ICM_20948.h"           // SparkFun ICM-20948 9-DoF IMU (Accel/Gyro/Mag)
 
 // ── WiFi & Server configuration ──────────────────────────────────────────────
 #define WIFI_SSID       "Verizon-SM-S901U-FA93"
 #define WIFI_PASSWORD   "cacz115/"
 #define SERVER_URL      "http://10.206.194.152:5000/nav"
-#define HTTP_INTERVAL   100   // ms between HTTP POSTs  (1 Hz — testing)
+#define HTTP_INTERVAL   100    // ms between HTTP POSTs  (10 Hz)
 
 // ── NTP configuration ────────────────────────────────────────────────────────
 #define NTP_SERVER      "pool.ntp.org"
@@ -27,38 +26,6 @@
 // ── TCA9548A I2C Multiplexer ──────────────────────────────────────────────────
 #define MUX_ADDR      0x77   // ToF MUX: A0/A1/A2 all tied to 3.3V → 0x77
 #define DRV_MUX_ADDR  0x70   // DRV MUX: A0/A1/A2 all GND → 0x70
-
-// ── ICM-20948 9-DoF IMU (SparkFun breakout, J_IMU_Back_Up1) ──────────────────
-// Wired on the I2C0 bus (SDA=GPIO7, SCL=GPIO8). AD0 pin tied to GND → addr 0x68.
-// Pins 8-11 (ACL/ADA/FSNC/INT) are unused for basic 9-DoF I2C operation.
-#define IMU_ADDR      0x68   // ICM-20948 (AD0=0); WHO_AM_I should report 0xEA
-static ICM_20948_I2C imuDev;
-static bool          imuPresent = false;
-static uint32_t      imuReadCount = 0;
-static uint32_t      imuErrCount  = 0;
-
-// ── Magnetometer hard-iron offsets (uT) ──────────────────────────────────────
-// Replace these with the values printed at the end of runMagCalibration().
-// Until calibrated, the heading will be biased — direction trends still work.
-static float magOffX = 0.0f;
-static float magOffY = 0.0f;
-static float magOffZ = 0.0f;
-
-// Set to 1 to run a 20-second magnetometer calibration sweep at boot.
-#define IMU_MAG_CALIBRATE_AT_BOOT 0
-
-// ── Computed orientation (filled by computeIMUOrientation) ────────────────────
-struct IMUOrient {
-  float roll_deg;     // rotation about body X (forward) — positive = right-side down
-  float pitch_deg;    // rotation about body Y (right)   — positive = nose up
-  float heading_deg;  // tilt-compensated yaw (0 = magnetic North, CW positive)
-  float accel_g;      // |accel| in g  (≈1.0 when stationary)
-  float gyro_dps;     // |gyro|  in deg/s
-  bool  isStill;      // accel ≈ 1g AND gyro nearly zero
-  bool  isTurning;    // |gyro_z| above threshold (yaw rotation)
-  bool  isFalling;    // |accel| ≪ 1g (free-fall window)
-};
-static IMUOrient imuOrient = { 0,0,0, 1.0f, 0, true, false, false };
 
 // ── C4001 24 GHz mmWave Radar ────────────────────────────────────────────────
 // Two Seeed C4001 sensors; each has a UART interface + a digital OUT pin.
@@ -257,6 +224,7 @@ struct TofSensor {
 // One Adafruit driver per sensor slot — all stay at 0x29; MUX isolates them.
 static Adafruit_VL53L1X tofDev[8];
 
+// millis() timestamp of last *accepted* VL53 sample per slot (0 = never)
 static uint32_t tofLastValidMs[8];
 
 //                  name          mux_ch  xshut  present  last   cnt    min    max  sum  err
@@ -354,7 +322,10 @@ static void initDrvMotors() {
   Serial.println("]");
 }
 
-// ── Haptic update — RTP driven from matched ToF reading ─────────────────
+// ── Haptic update (LEGACY local fallback) — RTP driven from raw ToF ──────
+// Kept for offline / standalone bring-up.  In normal operation the server
+// is authoritative (see applyServerMotorCommands below) and updateHaptics()
+// is NOT called from loop().
 // drvs[i] and tofs[i] share the same direction index.
 static void updateHaptics() {
   for (uint8_t i = 0; i < 8; i++) {
@@ -375,87 +346,112 @@ static void updateHaptics() {
   muxSelectDrv(0xFF);
 }
 
-// ── Navigation belt motor ────────────────────────────────────────────
-// The body module owns the *navigation* belt (one motor at a time, vibrating
-// in the direction the user should turn). It is independent of the hazard
-// haptic ring (updateHaptics, currently disabled).
+// ── Server-driven haptic update — RTP from /nav response motors[] ─────────
+// The server returns one motor command per direction:
+//   motors[k] = { motor_id:0..7, intensity:0..255, active:bool, ... }
 //
-// State is updated by sendNavData() each time the server responds to a /nav
-// POST -- the response carries a "nav_motor" JSON object with the resolved
-// command + motor_id + intensity + pattern. updateNavBeltMotor() runs every
-// loop() iteration and (a) PWM-modulates the chosen motor according to the
-// requested pattern and (b) keeps every other motor silent so no stale hum
-// leaks through when the command changes.
-struct NavMotorState {
-  int8_t   motor_id;       // 0-7 = belt slot, -1 = stop / silence everything
-  uint8_t  rtp_target;     // 0-127, peak RTP value when in the "on" phase
-  uint8_t  pattern_id;     // 0=off, 1=slow_pulse, 2=medium_pulse, 3=rapid_pulse
-  bool     active;
-  uint32_t phase_start_ms; // millis() when current pulse cycle started
-  uint32_t updated_ms;     // millis() of last server update (for safety timeout)
-};
-static NavMotorState navMotor = { -1, 0, 0, false, 0, 0 };
+// motor_id maps 1:1 with our drvs[] index (server algorithm.py guarantees
+// the order: 0=front, 1=front_right, … 7=front_left), so we can apply by
+// position without consulting the direction string.
+//
+// DRV2605L RTP register is signed 8-bit by default (range 0..127 positive
+// amplitude); we map server intensity → RTP by halving (intens >> 1).
+// Inactive motors are forced to 0 so a stale CRITICAL command can never
+// linger after the hazard clears.
+//
+// Pattern / frequency_hz from the server are ignored in this firmware —
+// RTP mode produces continuous vibration at the commanded amplitude.
+// To honour pulse patterns, modulate target over time in the loop().
+//
+// Total-power budget (anti-brownout):
+//   Each ERM motor pulls ~100–300 mA of inrush.  When 6+ directions all
+//   fire at full RTP=127 the LiPo+TPS63020 rail sags hard enough to crush
+//   the WiFi PA supply margin → packets get corrupted → "[HTTP] read
+//   Timeout" or full disconnect.  We cap the SUM of RTP values across the
+//   8 motors at MAX_TOTAL_RTP_BUDGET; if the server commands more, every
+//   motor is scaled down proportionally so direction is preserved but the
+//   battery never sees the full pile-on.  Tune downward if disconnects
+//   persist; upward if buzz feels weak with multiple hazards.
+static uint16_t consecutiveServerFailures = 0;
+#define SERVER_FAIL_SILENCE_CYCLES   5   // 5 × 100 ms = 500 ms — silence belt
+#define MAX_TOTAL_RTP_BUDGET        320  // ≈ 2.5 motors at full power
 
-// Hard safety: if no fresh /nav response arrives for this long, stop driving
-// the belt. Prevents a dropped WiFi connection from leaving a motor buzzing.
-#define NAV_BELT_FRESHNESS_MS 2000
+static void applyServerMotorCommands(JsonArray motors) {
+  consecutiveServerFailures = 0;            // success → reset watchdog
 
-static uint8_t navPatternId(const char* p) {
-  if (!p) return 0;
-  if (strcmp(p, "slow_pulse")   == 0) return 1;
-  if (strcmp(p, "medium_pulse") == 0) return 2;
-  if (strcmp(p, "rapid_pulse")  == 0) return 3;
-  return 0;  // "off" or unknown
-}
+  // ── Pass 1: compute target RTP per motor (no I²C yet) ────────────────
+  uint8_t  target[8] = {0};
+  uint16_t total     = 0;
+  for (JsonObject m : motors) {
+    int id = m["motor_id"] | -1;
+    if (id < 0 || id > 7) continue;
+    if (!drvs[id].present) continue;
 
-// Pulse cadence per pattern: returns (on_ms, off_ms). 0/0 = continuous.
-static void navPatternTiming(uint8_t id, uint32_t& on_ms, uint32_t& off_ms) {
-  switch (id) {
-    case 1: on_ms = 350; off_ms = 350; break;  // slow_pulse  ~1.4 Hz
-    case 2: on_ms = 200; off_ms = 200; break;  // medium_pulse ~2.5 Hz
-    case 3: on_ms = 100; off_ms = 100; break;  // rapid_pulse  ~5 Hz
-    default: on_ms = 0; off_ms = 0; break;     // off / continuous
+    bool active = m["active"]    | false;
+    int  intens = m["intensity"] | 0;
+    if (intens < 0)   intens = 0;
+    if (intens > 255) intens = 255;
+
+    target[id] = active ? (uint8_t)(intens >> 1) : 0;
+    total     += target[id];
   }
-}
 
-// Drive exactly the requested belt motor; silence the other seven.
-static void updateNavBeltMotor() {
-  uint32_t now = millis();
-
-  // Safety timeout — if the server stopped talking, silence the belt.
-  bool stale = navMotor.updated_ms == 0 ||
-               (uint32_t)(now - navMotor.updated_ms) > NAV_BELT_FRESHNESS_MS;
-
-  // Decide whether the chosen motor should be in its "on" phase right now.
-  bool wantOn = false;
-  if (!stale && navMotor.active &&
-      navMotor.motor_id >= 0 && navMotor.motor_id < 8 &&
-      navMotor.rtp_target > 0) {
-    uint32_t on_ms, off_ms;
-    navPatternTiming(navMotor.pattern_id, on_ms, off_ms);
-    if (on_ms == 0 && off_ms == 0) {
-      wantOn = true;  // continuous
-    } else {
-      uint32_t cycle = on_ms + off_ms;
-      uint32_t t     = (now - navMotor.phase_start_ms) % cycle;
-      wantOn = (t < on_ms);
+  // ── Budget cap: scale all motors proportionally if over budget ───────
+  // Q8 fixed-point scale factor avoids per-motor floating-point math.
+  if (total > MAX_TOTAL_RTP_BUDGET) {
+    uint32_t scale_q8 = ((uint32_t)MAX_TOTAL_RTP_BUDGET << 8) / total;
+    for (uint8_t i = 0; i < 8; i++) {
+      target[i] = (uint8_t)(((uint32_t)target[i] * scale_q8) >> 8);
     }
+    Serial.print("[NAV]  budget cap: total_rtp=");
+    Serial.print(total);
+    Serial.print(" > ");
+    Serial.print(MAX_TOTAL_RTP_BUDGET);
+    Serial.print(" → scale=");
+    Serial.print(scale_q8 / 256.0f, 2);
+    Serial.println(" (preventing brownout)");
   }
 
-  // Apply: only the active motor gets non-zero RTP.
-  bool muxTouched = false;
+  // ── Pass 2: apply targets via I²C (skip unchanged channels) ──────────
   for (uint8_t i = 0; i < 8; i++) {
     if (!drvs[i].present) continue;
-    uint8_t target = ((int8_t)i == navMotor.motor_id && wantOn)
-                       ? navMotor.rtp_target : 0;
-    if (target == drvs[i].rtp) continue;   // skip redundant I2C write
-    drvs[i].rtp = target;
+    if (target[i] == drvs[i].rtp) continue;   // no change — avoid I²C write
+    drvs[i].rtp = target[i];
     muxSelectDrv(drvs[i].mux_ch);
     delayMicroseconds(200);
-    drvDev[i].setRealtimeValue(target);
-    muxTouched = true;
+    drvDev[i].setRealtimeValue(target[i]);
   }
-  if (muxTouched) muxSelectDrv(0xFF);
+  muxSelectDrv(0xFF);
+}
+
+// Silence every motor — used as a safety fallback after several consecutive
+// server failures, so the user never feels a stale buzz commanded before
+// the link dropped.
+static void silenceAllMotors() {
+  for (uint8_t i = 0; i < 8; i++) {
+    if (!drvs[i].present || drvs[i].rtp == 0) continue;
+    drvs[i].rtp = 0;
+    muxSelectDrv(drvs[i].mux_ch);
+    delayMicroseconds(200);
+    drvDev[i].setRealtimeValue(0);
+  }
+  muxSelectDrv(0xFF);
+}
+
+// Counted-failure watchdog: invoked on every JSON parse error, non-200
+// response, or HTTP transport error.  After SERVER_FAIL_SILENCE_CYCLES
+// in a row the belt is forced silent so a stale command doesn't outlive
+// the connection.
+static void onServerFailure(const char* reason) {
+  consecutiveServerFailures++;
+  if (consecutiveServerFailures == SERVER_FAIL_SILENCE_CYCLES) {
+    Serial.print("[NAV]  server unreachable (");
+    Serial.print(reason);
+    Serial.print(") for ");
+    Serial.print((unsigned)consecutiveServerFailures * HTTP_INTERVAL);
+    Serial.println(" ms — silencing all motors");
+    silenceAllMotors();
+  }
 }
 
 // ── ToF initialisation — called once from setup() ────────────────────────────
@@ -516,9 +512,11 @@ static void initToFSensors() {
   Serial.println("]");
 }
 
+// VL53L1X validity band (mm) — harmonics / wrap often show as <40 mm junk.
 #define TOF_MIN_VALID_MM   40
 #define TOF_MAX_VALID_MM   4000
-// Hold last valid read ≥1 s when no new accepted VL53 sample (less flicker).
+// Hold the last *accepted* distance for this long with no new valid sample
+// before clearing (reduces UI / haptic flicker from brief VL53 drop-outs).
 #define TOF_STALE_MS       1000u
 
 static void tofResetSlot(uint8_t i) {
@@ -538,6 +536,7 @@ static void readToFSensors() {
     muxSelect(tofs[i].mux_ch);
     delayMicroseconds(200);              // brief settling after channel switch
 
+    // No accepted sample for ≥1 s (e.g. I2C / driver silent) → clear latched read.
     if (tofs[i].last_mm >= 0 && tofLastValidMs[i] != 0
         && (uint32_t)(now - tofLastValidMs[i]) > TOF_STALE_MS) {
       tofResetSlot(i);
@@ -551,6 +550,7 @@ static void readToFSensors() {
     const bool inBand = (d >= TOF_MIN_VALID_MM && d <= TOF_MAX_VALID_MM);
     if (d < 0 || !inBand) {
       tofs[i].err_count++;
+      // Explicit "no read" this frame → clear immediately so JSON / monitor show empty.
       if (tofs[i].last_mm >= 0) {
         tofResetSlot(i);
       }
@@ -662,198 +662,6 @@ static float readTempC() {
   return t;
 }
 
-// ── ICM-20948 IMU initialisation ─────────────────────────────────────────────
-// ad0 = 0 because schematic ties AD0 → GND (address 0x68).
-// Default ranges set: accel ±2g, gyro ±250 dps, magnetometer continuous 100 Hz.
-static bool initIMU() {
-  Wire.beginTransmission(IMU_ADDR);
-  if (Wire.endTransmission() != 0) {
-    Serial.println("  [FAIL] ICM-20948 not ACK at 0x68");
-    Serial.println("    → Check: VCC→3V3 (pin 2/7), GND (pin 1/12), SDA→GPIO7 (pin 3),");
-    Serial.println("             SCL→GPIO8 (pin 4), AD0→GND (pin 5)");
-    return false;
-  }
-  Serial.println("  [PASS] ICM-20948 ACK at 0x68");
-
-  imuDev.begin(Wire, 0);   // ad0val=false → AD0=0 (0x68)
-
-  if (imuDev.status != ICM_20948_Stat_Ok) {
-    Serial.print("  [FAIL] ICM-20948 begin() returned: ");
-    Serial.println(imuDev.statusString());
-    return false;
-  }
-
-  imuDev.swReset();
-  delay(50);
-  imuDev.sleep(false);
-  imuDev.lowPower(false);
-
-  if (imuDev.setSampleMode((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr),
-                           ICM_20948_Sample_Mode_Continuous) != ICM_20948_Stat_Ok) {
-    Serial.print("  [WARN] setSampleMode: "); Serial.println(imuDev.statusString());
-  }
-
-  ICM_20948_fss_t fss;
-  fss.a = gpm2;     // ±2 g
-  fss.g = dps250;   // ±250 dps
-  if (imuDev.setFullScale((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), fss)
-        != ICM_20948_Stat_Ok) {
-    Serial.print("  [WARN] setFullScale: "); Serial.println(imuDev.statusString());
-  }
-
-  if (imuDev.startupMagnetometer() != ICM_20948_Stat_Ok) {
-    Serial.print("  [WARN] Magnetometer startup: ");
-    Serial.println(imuDev.statusString());
-    Serial.println("         (Accel + Gyro will still work.)");
-  } else {
-    Serial.println("  [PASS] AK09916 magnetometer online");
-  }
-
-  return true;
-}
-
-// Compass direction (cardinal/intercardinal) for a 0–360° heading
-static const char* headingCardinal(float deg) {
-  if (deg < 0)   deg += 360.0f;
-  if (deg >= 360) deg -= 360.0f;
-  static const char* dirs[8] = {"N","NE","E","SE","S","SW","W","NW"};
-  return dirs[(int)((deg + 22.5f) / 45.0f) & 0x07];
-}
-
-// Derive roll/pitch (from gravity), tilt-compensated heading (from compass),
-// and motion-state booleans. Assumes imuDev.getAGMT() was called recently.
-static void computeIMUOrientation() {
-  if (!imuPresent) return;
-
-  float ax = imuDev.accX();
-  float ay = imuDev.accY();
-  float az = imuDev.accZ();
-  float gx = imuDev.gyrX();
-  float gy = imuDev.gyrY();
-  float gz = imuDev.gyrZ();
-  float mx = imuDev.magX() - magOffX;
-  float my = imuDev.magY() - magOffY;
-  float mz = imuDev.magZ() - magOffZ;
-
-  float roll  = atan2f(ay, az);
-  float pitch = atan2f(-ax, sqrtf(ay * ay + az * az));
-
-  float cR = cosf(roll),  sR = sinf(roll);
-  float cP = cosf(pitch), sP = sinf(pitch);
-  float mxh =  mx * cP + my * sR * sP + mz * cR * sP;
-  float myh =             my * cR     - mz * sR;
-
-  float yaw = atan2f(-myh, mxh);
-  if (yaw < 0) yaw += 2.0f * (float)PI;
-
-  imuOrient.roll_deg    = roll  * 180.0f / (float)PI;
-  imuOrient.pitch_deg   = pitch * 180.0f / (float)PI;
-  imuOrient.heading_deg = yaw   * 180.0f / (float)PI;
-
-  imuOrient.accel_g  = sqrtf(ax * ax + ay * ay + az * az) / 1000.0f;
-  imuOrient.gyro_dps = sqrtf(gx * gx + gy * gy + gz * gz);
-
-  imuOrient.isStill   = (fabsf(imuOrient.accel_g - 1.0f) < 0.05f) &&
-                        (imuOrient.gyro_dps < 5.0f);
-  imuOrient.isTurning = (fabsf(gz) > 30.0f);
-  imuOrient.isFalling = (imuOrient.accel_g < 0.4f);
-}
-
-// One-time magnetometer hard-iron calibration. See test_without_http.ino for
-// usage instructions. Behind IMU_MAG_CALIBRATE_AT_BOOT flag.
-static void runMagCalibration(uint16_t durationMs = 20000) {
-  if (!imuPresent) return;
-  Serial.println();
-  Serial.println("=== Magnetometer Calibration ===");
-  Serial.print("  Slowly rotate the device through ALL orientations for ");
-  Serial.print(durationMs / 1000); Serial.println(" seconds.");
-
-  float mxMin = 1e9f, myMin = 1e9f, mzMin = 1e9f;
-  float mxMax = -1e9f, myMax = -1e9f, mzMax = -1e9f;
-  uint32_t samples = 0;
-  uint32_t start = millis();
-  uint32_t lastTick = start;
-  while (millis() - start < durationMs) {
-    if (imuDev.dataReady()) {
-      imuDev.getAGMT();
-      if (imuDev.status == ICM_20948_Stat_Ok) {
-        float mx = imuDev.magX(), my = imuDev.magY(), mz = imuDev.magZ();
-        if (mx < mxMin) mxMin = mx;  if (mx > mxMax) mxMax = mx;
-        if (my < myMin) myMin = my;  if (my > myMax) myMax = my;
-        if (mz < mzMin) mzMin = mz;  if (mz > mzMax) mzMax = mz;
-        samples++;
-      }
-    }
-    if (millis() - lastTick >= 1000) {
-      lastTick = millis();
-      Serial.print("  t="); Serial.print((millis() - start) / 1000);
-      Serial.print("s  samples="); Serial.println(samples);
-    }
-    delay(10);
-  }
-  float offX = (mxMax + mxMin) * 0.5f;
-  float offY = (myMax + myMin) * 0.5f;
-  float offZ = (mzMax + mzMin) * 0.5f;
-  Serial.println("=== Calibration complete — paste into source ===");
-  Serial.print("  static float magOffX = "); Serial.print(offX, 2); Serial.println("f;");
-  Serial.print("  static float magOffY = "); Serial.print(offY, 2); Serial.println("f;");
-  Serial.print("  static float magOffZ = "); Serial.print(offZ, 2); Serial.println("f;");
-  magOffX = offX; magOffY = offY; magOffZ = offZ;
-}
-
-// Refresh all IMU values + derived orientation. Returns true when a fresh
-// reading was successfully consumed. Safe to call every loop.
-static bool readIMUOnce() {
-  if (!imuPresent) return false;
-  if (!imuDev.dataReady()) return false;
-  imuDev.getAGMT();
-  if (imuDev.status != ICM_20948_Stat_Ok) {
-    imuErrCount++;
-    return false;
-  }
-  imuReadCount++;
-  computeIMUOrientation();
-  return true;
-}
-
-// One-line human summary for live monitoring.
-static void printIMUReadings() {
-  if (!imuPresent) {
-    Serial.println("[IMU]  not present");
-    return;
-  }
-  Serial.print("[IMU]  A[mg]=");
-  Serial.print(imuDev.accX(), 0); Serial.print(",");
-  Serial.print(imuDev.accY(), 0); Serial.print(",");
-  Serial.print(imuDev.accZ(), 0);
-  Serial.print("  G[dps]=");
-  Serial.print(imuDev.gyrX(), 1); Serial.print(",");
-  Serial.print(imuDev.gyrY(), 1); Serial.print(",");
-  Serial.print(imuDev.gyrZ(), 1);
-  Serial.print("  M[uT]=");
-  Serial.print(imuDev.magX(), 1); Serial.print(",");
-  Serial.print(imuDev.magY(), 1); Serial.print(",");
-  Serial.print(imuDev.magZ(), 1);
-  Serial.print("  T[C]="); Serial.print(imuDev.temp(), 1);
-  Serial.print("  reads:"); Serial.print(imuReadCount);
-  if (imuErrCount) { Serial.print(" errs:"); Serial.print(imuErrCount); }
-  Serial.println();
-  Serial.print("[NAV]  roll=");  Serial.print(imuOrient.roll_deg, 1);
-  Serial.print("°  pitch=");      Serial.print(imuOrient.pitch_deg, 1);
-  Serial.print("°  hdg=");        Serial.print(imuOrient.heading_deg, 1);
-  Serial.print("° (");            Serial.print(headingCardinal(imuOrient.heading_deg));
-  Serial.print(")  |a|=");        Serial.print(imuOrient.accel_g, 2);
-  Serial.print("g  |w|=");        Serial.print(imuOrient.gyro_dps, 1);
-  Serial.print("°/s  state=");
-  if (imuOrient.isFalling)      Serial.print("FALLING!");
-  else if (imuOrient.isTurning) Serial.print("turning");
-  else if (imuOrient.isStill)   Serial.print("still");
-  else                          Serial.print("moving");
-  if (magOffX == 0.0f && magOffY == 0.0f && magOffZ == 0.0f)
-    Serial.print("  (mag uncalibrated)");
-  Serial.println();
-}
-
 
 // ── HTTP POST helper — conforms to server /nav JSON schema ──────────────────
 static void sendNavData(float voltage, float soc, float tempC, uint32_t freeHeap) {
@@ -875,8 +683,8 @@ static void sendNavData(float voltage, float soc, float tempC, uint32_t freeHeap
 
   StaticJsonDocument<2048> doc;
 
-  doc["device_id"] = "esp32_power";
-  doc["module"]    = "body";
+  doc["device_id"] = "esp32_head";
+  doc["module"]    = "head";
   struct timeval tv;
   gettimeofday(&tv, nullptr);
   uint64_t unix_ms = (uint64_t)tv.tv_sec * 1000ULL + tv.tv_usec / 1000ULL;
@@ -886,6 +694,7 @@ static void sendNavData(float voltage, float soc, float tempC, uint32_t freeHeap
   // ToF sensors
   JsonObject tofObj = doc.createNestedObject("tof_sensors");
   for (uint8_t i = 0; i < 8; i++) {
+    // Empty object = no valid current sample (do not ship stale last_mm after reset)
     if (!tofs[i].present || tofs[i].last_mm < 0) {
       tofObj.createNestedObject(tofs[i].name);
     } else {
@@ -912,49 +721,7 @@ static void sendNavData(float voltage, float soc, float tempC, uint32_t freeHeap
     }
   }
 
-  // ── IMU (ICM-20948) ─────────────────────────────────────────────────────
-  // Always emit the object — populated when the IMU is online, empty otherwise.
-  // Server side defaults missing fields to 0/false, so a partial drop is safe.
-  JsonObject imuObj = doc.createNestedObject("imu");
-  if (imuPresent && imuReadCount > 0) {
-    // Orientation (degrees) — derived by computeIMUOrientation()
-    imuObj["roll_deg"]         = serialized(String(imuOrient.roll_deg,    1));
-    imuObj["pitch_deg"]        = serialized(String(imuOrient.pitch_deg,   1));
-    imuObj["yaw_deg"]          = serialized(String(imuOrient.heading_deg, 1));
-    imuObj["heading_cardinal"] = headingCardinal(imuOrient.heading_deg);
-
-    // Accel — convert mg → m/s² so the schema "accel_z ≈ 9.8 at rest" holds
-    const float MG_TO_MPS2 = 9.80665f / 1000.0f;
-    imuObj["accel_x"] = serialized(String(imuDev.accX() * MG_TO_MPS2, 2));
-    imuObj["accel_y"] = serialized(String(imuDev.accY() * MG_TO_MPS2, 2));
-    imuObj["accel_z"] = serialized(String(imuDev.accZ() * MG_TO_MPS2, 2));
-
-    // Gyro (deg/s) — raw scaled
-    imuObj["gyro_x"] = serialized(String(imuDev.gyrX(), 1));
-    imuObj["gyro_y"] = serialized(String(imuDev.gyrY(), 1));
-    imuObj["gyro_z"] = serialized(String(imuDev.gyrZ(), 1));
-
-    // Magnetometer (uT) — raw (server sees the calibration flag separately)
-    imuObj["mag_x"] = serialized(String(imuDev.magX(), 1));
-    imuObj["mag_y"] = serialized(String(imuDev.magY(), 1));
-    imuObj["mag_z"] = serialized(String(imuDev.magZ(), 1));
-
-    imuObj["temp_c"]   = serialized(String(imuDev.temp(), 1));
-    imuObj["accel_g"]  = serialized(String(imuOrient.accel_g,  2));
-    imuObj["gyro_dps"] = serialized(String(imuOrient.gyro_dps, 1));
-
-    const char* st = "moving";
-    if      (imuOrient.isFalling) st = "falling";
-    else if (imuOrient.isTurning) st = "turning";
-    else if (imuOrient.isStill)   st = "still";
-    imuObj["motion_state"]   = st;
-    imuObj["is_still"]       = imuOrient.isStill;
-    imuObj["is_turning"]     = imuOrient.isTurning;
-    imuObj["is_falling"]     = imuOrient.isFalling;
-    imuObj["mag_calibrated"] = (magOffX != 0.0f || magOffY != 0.0f || magOffZ != 0.0f);
-    imuObj["read_count"]     = imuReadCount;
-    imuObj["err_count"]      = imuErrCount;
-  }
+  doc.createNestedObject("imu");  // not on head module
 
   // Haptic motor states
   JsonObject hapticObj = doc.createNestedObject("haptic_motors");
@@ -996,80 +763,41 @@ static void sendNavData(float voltage, float soc, float tempC, uint32_t freeHeap
       DeserializationError err = deserializeJson(resp_doc, resp);
       if (err) {
         Serial.print("[HTTP] JSON parse error: "); Serial.println(err.c_str());
+        onServerFailure("json_parse");
       } else {
+        // ── Apply motor commands FIRST so haptic latency is minimal ──────
+        // (do this before any Serial prints — Serial.print at 115200 baud
+        //  takes ~85 µs per byte, which would otherwise add tens of ms of
+        //  delay between RX and the first I²C write to DRV2605L.)
+        JsonArray motors = resp_doc["motors"].as<JsonArray>();
+        if (!motors.isNull() && motors.size() > 0) {
+          applyServerMotorCommands(motors);
+        } else {
+          // Head module always expects motors[]; treat missing as a failure
+          onServerFailure("missing_motors");
+        }
+
         // ── Hazard summary ──────────────────────────────────────────────
         int   hazardLevel = resp_doc["hazard"]["level"] | -1;
         const char* hazardLabel = resp_doc["hazard"]["label"] | "?";
         Serial.print("[NAV]  hazard="); Serial.print(hazardLabel);
         Serial.print(" (level="); Serial.print(hazardLevel); Serial.println(")");
 
-        // ── Motor commands from server (print only) ──────────────────────
-        // The "motors" array (8 entries) is the *hazard* haptic state,
-        // owned by the head module. The body module logs it for context
-        // but does not drive any motors from it.
-        JsonArray motors = resp_doc["motors"].as<JsonArray>();
+        // ── Per-motor diagnostic print ──────────────────────────────────
         for (JsonObject m : motors) {
+          int         id      = m["motor_id"]  | -1;
           const char* dir     = m["direction"] | "?";
           bool        active  = m["active"]    | false;
           int         intens  = m["intensity"] | 0;
           const char* zone    = m["zone"]      | "?";
           float       dist_m  = m["distance_m"]| -1.0f;
+          uint8_t     rtp_now = (id >= 0 && id < 8) ? drvs[id].rtp : 0;
           Serial.print("[NAV]    motor dir="); Serial.print(dir);
           Serial.print(" active="); Serial.print(active ? "Y" : "N");
           Serial.print(" intensity="); Serial.print(intens);
+          Serial.print(" rtp=");      Serial.print(rtp_now);
           Serial.print(" zone="); Serial.print(zone);
           if (dist_m >= 0) { Serial.print(" dist="); Serial.print(dist_m, 3); Serial.print("m"); }
-          Serial.println();
-        }
-
-        // ── Navigation belt motor (BODY module) ──────────────────────────
-        // The server returns the resolved nav-belt command in nav_motor.
-        // We translate it into RTP + pattern state and let
-        // updateNavBeltMotor() drive the DRV2605 every loop tick.
-        JsonObject nm = resp_doc["nav_motor"].as<JsonObject>();
-        if (!nm.isNull()) {
-          const char* cmd       = nm["command"]    | "stop";
-          int         motorId   = nm["motor_id"]   | -1;
-          int         intensity = nm["intensity"]  | 0;       // 0-204 server scale
-          const char* pattern   = nm["pattern"]    | "off";
-          bool        active    = nm["active"]     | false;
-          const char* instr     = nm["instruction"]| "";
-          float       distM     = nm["distance_m"] | -1.0f;
-
-          // Server uses a 0-255 PWM scale (max ≈ 204). Compress to the
-          // DRV2605 RTP range 0-127 so "back" (204) maps to max buzz.
-          int rtpScaled = (intensity * 127) / 204;
-          if (rtpScaled < 0)   rtpScaled = 0;
-          if (rtpScaled > 127) rtpScaled = 127;
-          uint8_t rtp = (uint8_t)rtpScaled;
-
-          uint8_t patId = navPatternId(pattern);
-
-          // If the command/pattern/motor changed, restart the pulse cycle
-          // from the "on" phase so the user feels the new cue immediately.
-          if (motorId != navMotor.motor_id ||
-              patId   != navMotor.pattern_id ||
-              active  != navMotor.active) {
-            navMotor.phase_start_ms = millis();
-          }
-          navMotor.motor_id    = (int8_t)constrain(motorId, -1, 7);
-          navMotor.rtp_target  = rtp;
-          navMotor.pattern_id  = patId;
-          navMotor.active      = active;
-          navMotor.updated_ms  = millis();
-
-          // Drive the belt right now so the user feels the new command on
-          // the same loop tick the response landed.
-          updateNavBeltMotor();
-
-          Serial.print("[NAV]  belt cmd=");      Serial.print(cmd);
-          Serial.print(" motor=");               Serial.print(motorId);
-          Serial.print(" intensity=");           Serial.print(intensity);
-          Serial.print(" rtp=");                 Serial.print(rtp);
-          Serial.print(" pattern=");             Serial.print(pattern);
-          Serial.print(" active=");              Serial.print(active ? "Y" : "N");
-          if (distM >= 0) { Serial.print(" dist="); Serial.print(distM, 1); Serial.print("m"); }
-          if (instr && *instr) { Serial.print(" instr=\""); Serial.print(instr); Serial.print("\""); }
           Serial.println();
         }
 
@@ -1079,9 +807,13 @@ static void sendNavData(float voltage, float soc, float tempC, uint32_t freeHeap
           Serial.print("[NAV]  latency="); Serial.print(latency, 1); Serial.println("ms");
         }
       }
+    } else {
+      // Non-200 response (e.g. 400 malformed_packet) — count as a failure
+      onServerFailure("http_status");
     }
   } else {
     Serial.print("[HTTP] Error: "); Serial.println(http.errorToString(code));
+    onServerFailure(http.errorToString(code).c_str());
   }
   http.end();
 }
@@ -1170,7 +902,6 @@ void setup() {
   Serial.println("  Scanning I2C addresses 0x08–0x77 ...");
   uint8_t devCount = 0;
   bool foundFuelGauge = false;
-  bool foundIMU       = false;
 
   for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
     Wire.beginTransmission(addr);
@@ -1185,8 +916,7 @@ void setup() {
         case 0x29: Serial.print("VL53L1X ToF (default addr)");    break;
         case 0x30: Serial.print("VL53L1X ToF (reassigned)");      break;
         case 0x5A: Serial.print("DRV2605L Haptic Driver");        break;
-        case 0x68: Serial.print("ICM-20948 9-DoF IMU (AD0=GND)"); foundIMU = true; break;
-        case 0x69: Serial.print("ICM-20948 9-DoF IMU (AD0=VCC)"); foundIMU = true; break;
+        case 0x68: Serial.print("MPU-6050 / DS3231 RTC");         break;
         default:   Serial.print("Unknown device");                break;
       }
       Serial.println();
@@ -1314,31 +1044,6 @@ void setup() {
   }
   Serial.println();
 
-  // ── TEST 11: ICM-20948 9-DoF IMU (J_IMU_Back_Up1) ─────────────────────────
-  Serial.println("[TEST 11] ICM-20948 9-DoF IMU @ 0x68 (I2C0 bus, AD0=GND)");
-  if (!foundIMU) {
-    printFail("ICM-20948 not seen during I2C scan — skipping init");
-    Serial.println("  Check: 3V3 (J_IMU pin 2/7), GND (pin 1/12),");
-    Serial.println("         SDA→GPIO7 (pin 3), SCL→GPIO8 (pin 4), AD0→GND (pin 5)");
-    recordResult("ICM-20948 IMU", false, "not on bus");
-  } else {
-    imuPresent = initIMU();
-    if (imuPresent) {
-      printPass("ICM-20948 initialised (Accel + Gyro + Mag online)");
-#if IMU_MAG_CALIBRATE_AT_BOOT
-      runMagCalibration(20000);
-#endif
-      delay(20);
-      readIMUOnce();
-      printIMUReadings();
-      recordResult("ICM-20948 IMU", true, "9-DoF online");
-    } else {
-      printFail("ICM-20948 init failed");
-      recordResult("ICM-20948 IMU", false, "init error");
-    }
-  }
-  Serial.println();
-
   // ── WiFi connection ───────────────────────────────────────────────────────
   Serial.print("Connecting to WiFi: "); Serial.println(WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -1384,17 +1089,12 @@ void loop() {
   // ── Poll mmWave radar OUT pins + drain UART buffers ───────────────────────
   pollRadars();
 
-  // ── Poll the IMU (refreshes raw + derived orientation) ────────────────────
-  readIMUOnce();
-
-  // ── Update haptic motors from latest ToF readings ── DISABLED ────────
-  // The hazard haptic ring is driven by the HEAD module, not the body.
+  // ── Haptic motors are driven by the server response inside sendNavData()
+  // (applyServerMotorCommands).  The legacy local-only path below stays
+  // disabled in normal operation; uncomment to bring up motors without a
+  // server (offline test) — but be aware it reads raw ToF and so will
+  // glitch on VL53L1X range_status errors.
   // updateHaptics();
-
-  // ── Drive the navigation belt motor (single motor, per-pattern PWM) ──
-  // navMotor state is refreshed by sendNavData() each /nav cycle; this
-  // keeps the chosen motor pulsing at the right cadence between updates.
-  updateNavBeltMotor();
 
   // ── HTTP POST at 10 Hz ────────────────────────────────────────────────────
   static unsigned long lastPost = 0;
@@ -1494,7 +1194,4 @@ void loop() {
     }
     Serial.println();
   }
-
-  // ── ICM-20948 9-DoF IMU: accel/gyro/mag/temp + orientation ───────────────
-  printIMUReadings();
 }

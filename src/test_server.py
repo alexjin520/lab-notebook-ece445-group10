@@ -299,6 +299,7 @@ route_state: dict[str, Any] = {
     "origin": None, "destination": None, "dest_name": "",
     "steps": [], "step_index": 0, "total_distance_m": 0,
     "total_duration_s": 0, "active": False, "updated_at": time.time(),
+    "path_coords": [], "overview_polyline": None,
 }
 
 position_state: dict[str, Any] = {
@@ -824,6 +825,11 @@ def nav_set_route():
     We store it and use it as the sim walker's path.
     """
     data = request.get_json(silent=True) or {}
+    op = data.get("overview_polyline")
+    overview = (
+        op if isinstance(op, str) and op.strip()
+        else (op.get("points") if isinstance(op, dict) else None)
+    )
     route_state.update({
         "origin":           data.get("origin"),
         "destination":      data.get("destination"),
@@ -834,6 +840,8 @@ def nav_set_route():
         "total_duration_s": float(data.get("total_duration_s", 0)),
         "active":           bool(data.get("active", True)),
         "updated_at":       time.time(),
+        "path_coords":      data.get("path_coords") or [],
+        "overview_polyline": overview,
     })
     _nav_stats["routes_set"] += 1
 

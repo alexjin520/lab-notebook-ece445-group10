@@ -120,6 +120,45 @@ input[type=range]{flex:1;accent-color:var(--accent)}
 .imu-val.pitch{color:#38bdf8}
 .imu-val.yaw{color:var(--accent)}
 .imu-val.az{color:var(--ok)}
+.imu-empty{padding:12px;background:var(--el);border:1px dashed var(--border);
+  border-radius:7px;text-align:center;color:var(--muted);font-size:11px}
+.imu-extra{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}
+.imu-extra .ie-cell{background:var(--el);border:1px solid var(--border);
+  border-radius:6px;padding:6px 8px;font-size:11px;font-family:monospace}
+.imu-extra .ie-lbl{font-size:9px;color:var(--muted);text-transform:uppercase;
+  letter-spacing:.5px;margin-bottom:2px;font-family:inherit}
+.imu-state{display:inline-block;padding:2px 8px;border-radius:10px;
+  font-size:10px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;
+  margin-right:4px}
+.imu-state.still{background:rgba(100,116,139,.25);color:#94a3b8}
+.imu-state.moving{background:rgba(56,189,248,.25);color:#38bdf8}
+.imu-state.turning{background:rgba(167,139,250,.25);color:#a78bfa}
+.imu-state.falling{background:rgba(244,63,94,.30);color:#f43f5e}
+.imu-state.calibrated{background:rgba(34,197,94,.25);color:#22c55e}
+.imu-state.uncalibrated{background:rgba(245,158,11,.25);color:#f59e0b}
+
+/* ── Turn confirmation panel ──────────────────────────────────── */
+.turn-panel{background:var(--el);border:1px solid var(--border);
+  border-radius:8px;padding:10px}
+.turn-head{display:flex;justify-content:space-between;align-items:center;
+  margin-bottom:8px}
+.turn-cmd{font-family:monospace;font-size:13px;font-weight:700;color:var(--accent)}
+.turn-state{font-size:10px;text-transform:uppercase;letter-spacing:.6px;
+  padding:2px 8px;border-radius:10px;font-weight:600}
+.turn-state.idle{background:rgba(100,116,139,.25);color:#94a3b8}
+.turn-state.active{background:rgba(56,189,248,.25);color:#38bdf8}
+.turn-state.completed{background:rgba(34,197,94,.30);color:#22c55e}
+.turn-state.timeout{background:rgba(245,158,11,.30);color:#f59e0b}
+.turn-bar-wrap{background:var(--bg);border-radius:3px;height:8px;
+  overflow:hidden;border:1px solid var(--border)}
+.turn-bar{height:100%;background:linear-gradient(90deg,#38bdf8,var(--accent));
+  transition:width .3s}
+.turn-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;
+  margin-top:8px;font-size:11px}
+.turn-stats .ts-cell{background:var(--bg);border-radius:5px;padding:5px 7px;
+  text-align:center;font-family:monospace}
+.turn-stats .ts-lbl{font-size:8px;color:var(--muted);text-transform:uppercase;
+  letter-spacing:.5px;margin-bottom:1px;font-family:inherit}
 
 /* ── Power panel ──────────────────────────────────────────────── */
 .power-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
@@ -201,6 +240,15 @@ input[type=range]{flex:1;accent-color:var(--accent)}
   <div class="tab-bar">
     <button class="tab active" onclick="showTab('live')">⬤ Live</button>
     <button class="tab" onclick="showTab('log')">📂 Log Replay</button>
+    <a class="tab" href="/dashboard/head"
+       style="text-decoration:none;display:inline-flex;align-items:center"
+       title="Open the head-only monitor in this tab">◉ Head</a>
+    <a class="tab" href="/dashboard/body"
+       style="text-decoration:none;display:inline-flex;align-items:center"
+       title="Open the body-only monitor in this tab">◉ Body</a>
+    <a class="tab" href="/dashboard/second"
+       style="text-decoration:none;display:inline-flex;align-items:center"
+       title="Open the 1 Hz demo replay (head + body in lock-step with video)">⏱ 1 Hz Demo</a>
   </div>
   <div class="hdr-right">
     <span class="conn-dot" id="cdot"></span>
@@ -274,10 +322,14 @@ input[type=range]{flex:1;accent-color:var(--accent)}
     <!-- RIGHT: IMU + Power + Stats -->
     <div style="display:flex;flex-direction:column;gap:12px">
       <div class="card">
-        <div class="card-title">IMU — Head Module</div>
-        <div class="imu-module" id="imu-head-panel"></div>
-        <div class="card-title" style="margin-top:8px">IMU — Body Module</div>
+        <div class="card-title">IMU — Body Module <span style="color:var(--muted);font-weight:400">· ICM-20948</span></div>
         <div class="imu-module" id="imu-body-panel"></div>
+        <div class="card-title" style="margin-top:8px">IMU — Head Module</div>
+        <div class="imu-module" id="imu-head-panel"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Navigation · Turn confirmation</div>
+        <div class="turn-panel" id="turn-panel"></div>
       </div>
       <div class="card">
         <div class="card-title">Power &amp; System</div>
@@ -483,11 +535,37 @@ function setConnStatus(s) {
 }
 
 // ─── Live polling ──────────────────────────────────────────────────────────────
+/** Clears live ToF / fused / motor panels when the server has no packet yet (204). */
+function liveEmptySensorPayload() {
+  const nullTof = {};
+  const fused = {};
+  DIRS.forEach(d => {
+    nullTof[d] = null;
+    fused[d] = { dist_m: null, zone: "CLEAR", source: "none" };
+  });
+  return {
+    status: "ok",
+    tof_body: { ...nullTof },
+    tof_head: { ...nullTof },
+    fused,
+    motors: [],
+    hazard: { level: 0, label: "CLEAR", alerts: [] },
+    mmwave_body: {}, mmwave_head: {},
+    imu_body: {}, imu_head: {},
+    turn_status: {}, orientation: {},
+    power: {},
+    pkt_rate_hz: null, latency_ms: null, proc_ms: null, pkt_count: null,
+  };
+}
+
 async function fetchLive() {
   if (!connected) return;
   try {
     const r = await fetch(`${serverUrl}/sensor_state`, {signal: AbortSignal.timeout(1000)});
-    if (r.status === 204) return; // no data yet
+    if (r.status === 204) {
+      renderAll(liveEmptySensorPayload(), "live");
+      return;
+    }
     if (!r.ok) throw new Error();
     const d = await r.json();
     if (d.status === "ok") renderAll(d, "live");
@@ -506,8 +584,9 @@ function renderAll(data, ns) {
   drawMotorRing(data.motors || [], `${pfx}motor-svg`, `${pfx}motor-chips`);
   renderMotorTable(data.motors || [], `${pfx}motor-tbl-body`);
   if (data.mmwave_body !== undefined) renderMmwave(data, "mmwave-tbl-body");
-  renderImu(data.imu_head || data.imu_combined || {}, `${pfx}imu-head-panel`, "head");
   renderImu(data.imu_body || {}, `${pfx}imu-body-panel`, "body");
+  renderImu(data.imu_head || {}, `${pfx}imu-head-panel`, "head");
+  renderTurnPanel(data.turn_status || {}, data.orientation || {}, `${pfx}turn-panel`);
   renderPower(data.power || {}, `${pfx}power-panel`);
   renderStats(data, `${pfx}stats-panel`);
 }
@@ -823,16 +902,96 @@ function renderMmwave(data, tbodyId) {
 function renderImu(imu, panelId, label) {
   const el = document.getElementById(panelId);
   if (!el) return;
-  const r = imu.roll_deg  ?? imu.roll  ?? 0;
-  const p = imu.pitch_deg ?? imu.pitch ?? 0;
-  const y = imu.yaw_deg   ?? imu.yaw   ?? 0;
-  const z = imu.accel_z   ?? 9.81;
+
+  // A module without an IMU (current build: head) sends an empty {} or a
+  // payload with no roll/pitch/yaw fields. Show a clear placeholder so we
+  // never pretend zero readings are real.
+  const hasData = imu && (imu.roll_deg !== undefined || imu.pitch_deg !== undefined
+                          || imu.yaw_deg !== undefined  || imu.accel_z !== undefined);
+  if (!hasData) {
+    el.innerHTML = `<div class="imu-empty">
+      <div style="font-size:13px;color:var(--accent);margin-bottom:4px">No IMU on this module</div>
+      <div>Current build mounts a single ICM-20948 on the body module.</div>
+    </div>`;
+    return;
+  }
+
+  const r  = imu.roll_deg  ?? imu.roll  ?? 0;
+  const p  = imu.pitch_deg ?? imu.pitch ?? 0;
+  const y  = imu.yaw_deg   ?? imu.yaw   ?? 0;
+  const z  = imu.accel_z   ?? 9.81;
+  const ag = imu.accel_g   ?? null;
+  const gd = imu.gyro_dps  ?? null;
+  const tc = imu.temp_c    ?? null;
+  const hc = imu.heading_cardinal || "";
+  const ms = imu.motion_state || "";
+  const isFalling = !!imu.is_falling;
+  const isTurning = !!imu.is_turning;
+  const isStill   = !!imu.is_still;
+  const magCal    = !!imu.mag_calibrated;
+
+  const stateChip = (cls, txt) => `<span class="imu-state ${cls}">${txt}</span>`;
+  const chips = [];
+  if (isFalling) chips.push(stateChip("falling", "Falling"));
+  else if (isTurning) chips.push(stateChip("turning", "Turning"));
+  else if (isStill) chips.push(stateChip("still", "Still"));
+  else if (ms) chips.push(stateChip("moving", ms));
+  chips.push(stateChip(magCal ? "calibrated" : "uncalibrated",
+                       magCal ? "Mag cal" : "Mag uncal"));
+
   el.innerHTML = `<div class="imu-row">
     <div class="imu-gauge"><div class="imu-label">Roll</div><div class="imu-val roll">${r.toFixed(1)}°</div></div>
     <div class="imu-gauge"><div class="imu-label">Pitch</div><div class="imu-val pitch">${p.toFixed(1)}°</div></div>
-    <div class="imu-gauge"><div class="imu-label">Yaw</div><div class="imu-val yaw">${y.toFixed(1)}°</div></div>
-    <div class="imu-gauge"><div class="imu-label">Accel Z</div><div class="imu-val az">${z.toFixed(2)}</div></div>
+    <div class="imu-gauge"><div class="imu-label">Yaw ${hc?`(${hc})`:""}</div><div class="imu-val yaw">${y.toFixed(1)}°</div></div>
+    <div class="imu-gauge"><div class="imu-label">|a|</div><div class="imu-val az">${ag!=null?ag.toFixed(2)+" g":z.toFixed(2)}</div></div>
+  </div>
+  <div style="margin-top:8px;text-align:center">${chips.join("")}</div>
+  <div class="imu-extra">
+    <div class="ie-cell"><div class="ie-lbl">Gyro</div>${gd!=null?gd.toFixed(1)+" °/s":"—"}</div>
+    <div class="ie-cell"><div class="ie-lbl">IMU temp</div>${tc!=null?tc.toFixed(1)+" °C":"—"}</div>
   </div>`;
+}
+
+// ─── Turn confirmation panel ──────────────────────────────────────────────────
+function renderTurnPanel(turn, orient, panelId) {
+  const el = document.getElementById(panelId);
+  if (!el) return;
+  turn   = turn   || {};
+  orient = orient || {};
+
+  const cmd       = turn.command || "stop";
+  const expected  = turn.expected_deg ?? 0;
+  const progress  = turn.progress_deg ?? 0;
+  const pct       = Math.max(0, Math.min(1, turn.completion_pct ?? 0));
+  const yaw       = turn.current_yaw ?? orient.yaw_deg ?? null;
+  const elapsed   = turn.elapsed_s ?? 0;
+  const timeout   = turn.timeout_s ?? 30;
+
+  let stateCls = "idle", stateTxt = "Idle";
+  if (turn.completed) { stateCls = "completed"; stateTxt = "Confirmed"; }
+  else if (turn.active) { stateCls = "active"; stateTxt = "Tracking"; }
+  else if (cmd !== "stop" && cmd !== "front" && elapsed >= timeout) {
+    stateCls = "timeout"; stateTxt = "Timeout";
+  }
+
+  const barPct = (expected > 0 ? pct * 100 : 0).toFixed(0);
+
+  el.innerHTML = `
+    <div class="turn-head">
+      <div>
+        <div class="turn-cmd">${cmd.toUpperCase().replace("_"," ")}</div>
+        <div style="font-size:10px;color:var(--muted);margin-top:2px">
+          ${expected > 0 ? `expecting ${expected.toFixed(0)}° turn` : "no active turn"}
+        </div>
+      </div>
+      <span class="turn-state ${stateCls}">${stateTxt}</span>
+    </div>
+    <div class="turn-bar-wrap"><div class="turn-bar" style="width:${barPct}%"></div></div>
+    <div class="turn-stats">
+      <div class="ts-cell"><div class="ts-lbl">Progress</div>${progress.toFixed(1)}°</div>
+      <div class="ts-cell"><div class="ts-lbl">Yaw</div>${yaw!=null?yaw.toFixed(1)+"°":"—"}</div>
+      <div class="ts-cell"><div class="ts-lbl">Elapsed</div>${elapsed.toFixed(1)}s</div>
+    </div>`;
 }
 
 // ─── Power panel ──────────────────────────────────────────────────────────────
@@ -969,16 +1128,35 @@ function parseLogFile(text) {
       }
     }
   }
+
+  // Forward-fill the IMU snapshots so the body IMU panel doesn't blink
+  // out on every other frame (head packets in this build don't carry an
+  // IMU_READ line). A module that *never* reports an IMU stays empty,
+  // which is what triggers the "No IMU on this module" placeholder.
+  let lastBody = null;
+  let lastHead = null;
+  for (const f of frames) {
+    if (Object.keys(f.imu_body).length > 0)       lastBody = f.imu_body;
+    else if (lastBody)                            f.imu_body = lastBody;
+    if (Object.keys(f.imu_head).length > 0)       lastHead = f.imu_head;
+    else if (lastHead)                            f.imu_head = lastHead;
+  }
   return frames;
 }
 
 function parseFrame(block) {
+  // Note: IMU defaults are EMPTY ({}) -- a frame with no IMU_READ should
+  // render as "No IMU on this module" (renderImu's empty-state branch),
+  // not as a phantom 0/0/0 reading. The forward-fill pass after parsing
+  // all blocks (see parseLogFile) is responsible for carrying the last
+  // observed body-IMU snapshot through subsequent head packets so the
+  // body IMU panel doesn't flicker every other frame.
   const frame = {
     pkt: block.pkt, device: block.device,
     tof_body: {}, tof_head: {},
     mmwave_body: {}, mmwave_head: {},
-    imu_head: {roll_deg:0,pitch_deg:0,yaw_deg:0,accel_z:9.81},
-    imu_body: {roll_deg:0,pitch_deg:0,yaw_deg:0,accel_z:9.81},
+    imu_head: {},
+    imu_body: {},
     fused: {}, motors: [],
     hazard: {level:0, label:"CLEAR", alerts:[]},
     power: {}, pkt_rate_hz: null, proc_ms: null, latency_ms: null,
@@ -1020,7 +1198,7 @@ function parseFrame(block) {
 
     // IMU_READ
     if (line.includes("[VERIFY:IMU_READ]")) {
-      const m = line.match(/module=(\w+)\s+roll=\s*([-\d.]+)\s+pitch=\s*([-\d.]+)\s+yaw=\s*([-\d.]+)\s+accel_z=([\d.]+)/);
+      const m = line.match(/module=(\w+)\s+roll=\s*([-\d.]+)\s+pitch=\s*([-\d.]+)\s+yaw=\s*([-\d.]+)\s+accel_z=\s*([-\d.]+)/);
       if (m) {
         const mod = m[1];
         const imu = {roll_deg:+m[2],pitch_deg:+m[3],yaw_deg:+m[4],accel_z:+m[5]};
@@ -1091,8 +1269,10 @@ function parseFrame(block) {
       if (m) frame.proc_ms = +m[1];
     }
 
-    // LATENCY_WARN
-    if (line.includes("[VERIFY:LATENCY_WARN]")) {
+    // LATENCY_WARN / LATENCY_INFO -- both carry the same e2e latency in ms,
+    // _WARN is emitted when the figure exceeds the budget, _INFO otherwise.
+    if (line.includes("[VERIFY:LATENCY_WARN]") ||
+        line.includes("[VERIFY:LATENCY_INFO]")) {
       const m = line.match(/latency_ms=([\d.]+)/);
       if (m) frame.latency_ms = +m[1];
     }
@@ -1162,8 +1342,29 @@ function clearLog() {
   document.getElementById("play-btn").textContent = "▶ Play";
 }
 
+// ─── Tab link rewriter ────────────────────────────────────────────────────
+// The Head/Body anchor tabs use absolute Flask URLs (/dashboard/head,
+// /dashboard/body).  When the page is served by a plain static file server
+// instead of Flask (e.g. python -m http.server 8080), rewrite those hrefs
+// to the literal HTML filenames so the tabs stay clickable.
+function fixTabLinks() {
+  const isFlask = location.pathname.startsWith("/dashboard");
+  if (isFlask) return;  // Flask routes already match the hrefs as-is.
+  const map = {
+    "/dashboard":        "sensor_dashboard.html",
+    "/dashboard/head":   "head_dashboard.html",
+    "/dashboard/body":   "body_dashboard.html",
+    "/dashboard/second": "second_dashboard.html",
+  };
+  document.querySelectorAll("a.tab").forEach(a => {
+    const href = a.getAttribute("href");
+    if (map[href]) a.setAttribute("href", map[href]);
+  });
+}
+
 // ─── Initial render (empty state) ─────────────────────────────────────────────
 (function init() {
+  fixTabLinks();
   document.getElementById("server-inp").value = serverUrl;
   drawRadar({}, "radar-svg", radarMaxM);
   drawMotorRing([], "motor-svg", "motor-chips");
@@ -1171,6 +1372,7 @@ function clearLog() {
   drawMotorRing([], "log-motor-svg", "log-motor-chips");
   renderImu({}, "imu-head-panel", "head");
   renderImu({}, "imu-body-panel", "body");
+  renderTurnPanel({}, {}, "turn-panel");
   renderPower({}, "power-panel");
   renderStats({}, "stats-panel");
 })();
